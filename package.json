@@ -1,0 +1,39 @@
+{
+  "name": "@ghost/desktop",
+  "version": "0.4.3",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "ghost-desktop: Hyprland computer use as a stdio MCP server — look at and act on the desktop.",
+  "type": "module",
+  "bin": {
+    "ghost-desktop": "./dist/main.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun --bun ./node_modules/vitest/vitest.mjs run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^22.15.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
