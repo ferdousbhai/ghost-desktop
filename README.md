@@ -19,7 +19,7 @@ bun install -g github:ferdousbhai/ghost-desktop
 claude mcp add --scope user desktop -- ghost-desktop
 ```
 
-Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.2`. Bun puts
+Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.3`. Bun puts
 `ghost-desktop` in `~/.bun/bin`. TypeScript throughout, run by Bun directly;
 its only package dependency is the MCP SDK.
 
@@ -101,4 +101,4 @@ The Wayland wire protocol and the Lua dispatch encoding are ported from
 [hypruse](https://github.com/IlyasKhallouki/hypruse); the lock check, chord
 table, and window capture approach from
 [omarchy-quattro-harness](https://github.com/fabiopauli/omarchy-quattro-harness).
-Both MIT; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Apache-2.0.
+Both MIT; see [NOTICE.md](NOTICE.md). Apache-2.0.
