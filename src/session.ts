@@ -28,3 +28,34 @@ export function connectUnix(path: string, what: string, timeoutMs = 3000): Promi
     });
   });
 }
+
+/**
+ * Bytes received but not yet parsed, for a wire client. A chunk is appended
+ * without re-copying what is pending; parsed bytes are dropped from the front.
+ */
+export class ByteQueue {
+  private buffer = Buffer.alloc(4096);
+  private head = 0;
+  private tail = 0;
+
+  /** Append a chunk and return everything pending, as a view. */
+  push(chunk: Uint8Array): Buffer {
+    const pending = this.tail - this.head;
+    if (this.tail + chunk.length > this.buffer.length) {
+      const target = pending + chunk.length > this.buffer.length ? Buffer.alloc(Math.max(this.buffer.length * 2, pending + chunk.length)) : this.buffer;
+      this.buffer.copy(target, 0, this.head, this.tail);
+      this.buffer = target;
+      this.head = 0;
+      this.tail = pending;
+    }
+    this.buffer.set(chunk, this.tail);
+    this.tail += chunk.length;
+    return this.buffer.subarray(this.head, this.tail);
+  }
+
+  /** Drop the first `count` pending bytes, once they are parsed. */
+  consume(count: number): void {
+    this.head += count;
+    if (this.head === this.tail) this.head = this.tail = 0;
+  }
+}

@@ -5,7 +5,7 @@
  */
 import type { Socket } from "node:net";
 import { DesktopError } from "./errors.js";
-import { connectUnix, runtimeDir } from "./session.js";
+import { ByteQueue, connectUnix, runtimeDir } from "./session.js";
 
 export interface Variant {
   readonly signature: string;
@@ -385,10 +385,7 @@ function uidHex(): string {
 export class DBusConnection {
   private serial = 0;
   private readonly pending = new Map<number, Pending>();
-  // Received bytes not yet decoded: a growable buffer, so a large reply that
-  // arrives in many chunks is appended, not re-copied whole per chunk.
-  private buffer = new Uint8Array(4096);
-  private buffered = 0;
+  private readonly received = new ByteQueue();
   private closedError: DBusError | null = null;
 
   private constructor(private readonly socket: Socket, private readonly defaultTimeoutMs: number) {}
@@ -440,28 +437,16 @@ export class DBusConnection {
   }
 
   private receive(chunk: Uint8Array): void {
-    if (this.buffered + chunk.length > this.buffer.length) {
-      let size = this.buffer.length * 2;
-      while (size < this.buffered + chunk.length) size *= 2;
-      const grown = new Uint8Array(size);
-      grown.set(this.buffer.subarray(0, this.buffered));
-      this.buffer = grown;
-    }
-    this.buffer.set(chunk, this.buffered);
-    this.buffered += chunk.length;
+    const pending = this.received.push(chunk);
     let decoded: ReturnType<typeof decodeMessages>;
     try {
-      decoded = decodeMessages(this.buffer.subarray(0, this.buffered));
+      decoded = decodeMessages(pending);
     } catch (error) {
       this.fail((error as Error).message);
       this.socket.destroy();
       return;
     }
-    // Move only the undecoded tail to the front, and only when a message was consumed.
-    if (decoded.rest.length !== this.buffered) {
-      this.buffer.copyWithin(0, this.buffered - decoded.rest.length, this.buffered);
-      this.buffered = decoded.rest.length;
-    }
+    this.received.consume(pending.length - decoded.rest.length);
     for (const message of decoded.messages) {
       if (message.replySerial === undefined) continue;
       const waiter = this.pending.get(message.replySerial);

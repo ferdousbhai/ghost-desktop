@@ -13,6 +13,7 @@ import {
   PTR_AXIS_DISCRETE,
   PTR_AXIS_SOURCE,
   PTR_BUTTON,
+  PTR_DESTROY,
   PTR_FRAME,
   scrollMessages,
   toFixed,
@@ -168,7 +169,7 @@ describe("openVirtualPointer against a fake compositor", () => {
     const pointer = await openVirtualPointer({ WAYLAND_DISPLAY: compositor.path });
     await pointer.click("left", 1);
     await pointer.close();
-    expect(compositor.pointerOps()).toEqual([PTR_BUTTON, PTR_FRAME, PTR_BUTTON, PTR_FRAME, 8]);
+    expect(compositor.pointerOps()).toEqual([PTR_BUTTON, PTR_FRAME, PTR_BUTTON, PTR_FRAME, PTR_DESTROY]);
   });
 
   it("stays on the continuous axis when only version 1 is offered", async () => {

@@ -7,6 +7,7 @@ import type { Capture } from "../src/capture.js";
 import { createDesktop } from "../src/desktop.js";
 import { DesktopError } from "../src/errors.js";
 import type { Hypr, HyprClient, Intent } from "../src/hypr.js";
+import { client } from "./helpers/client.js";
 import { DesktopLease } from "../src/lease.js";
 import type { Runner } from "../src/run.js";
 import type { VirtualPointer } from "../src/wayland.js";
@@ -16,10 +17,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const foot: HyprClient = {
-  address: "0xa", class: "foot", title: "foot", pid: 7, at: [0, 0], size: [400, 300], workspace: { id: 1, name: "1" },
-  floating: false, fullscreen: 0, hidden: false, mapped: true, focusHistoryID: 0, stableId: "s1",
-};
+const foot = client({ pid: 7, size: [400, 300], stableId: "s1" });
 const files: HyprClient = { ...foot, address: "0xb", class: "org.gnome.Nautilus", title: "data", pid: 8, at: [0, 300], focusHistoryID: 1 };
 
 function element(ref: string, name: string, over: Partial<AxElement> = {}): AxElement {
@@ -42,7 +40,7 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
     cursor: async () => [0, 0],
     locked: async () => (options.locked === undefined ? false : options.locked),
     dispatch: async (intent) => {
-      if (intent.kind === "shortcut" && options.shortcutFails) throw new DesktopError("failed", "no keysym");
+      if (intent.kind === "shortcut" && options.shortcutFails) throw new DesktopError("failed", "key not found", { refused: "send_shortcut: key not found" });
       dispatched.push(intent);
       if (intent.kind === "focus") active = intent.address;
     },
@@ -66,7 +64,10 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
     setText: async (ref, text) => void performed.push(`${known(ref).ref}=${text}`),
     setValue: async (ref, value) => void performed.push(`${known(ref).ref}=${value}`),
     focus: async (ref) => void performed.push(`${known(ref).ref}:focus`),
-    element: async (ref) => known(ref),
+    extents: async (ref) => {
+      const box = known(ref).box;
+      return { pid: 8, ...(box ? { box: [box[0] - files.at[0], box[1] - files.at[1], box[2], box[3]] as [number, number, number, number] } : {}) };
+    },
     close: async () => {},
   };
   const pointer: VirtualPointer = {

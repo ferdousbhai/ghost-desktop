@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createCapture, imageSize, parseRegion } from "../src/capture.js";
-import type { HyprClient, HyprMonitor } from "../src/hypr.js";
+import type { HyprMonitor } from "../src/hypr.js";
+import { client } from "./helpers/client.js";
 import type { Runner } from "../src/run.js";
 
 function png(width: number, height: number): Uint8Array {
@@ -12,10 +13,7 @@ function png(width: number, height: number): Uint8Array {
   return bytes;
 }
 
-const client: HyprClient = {
-  address: "0xa", class: "foot", title: "t", pid: 1, at: [10, 20], size: [300, 200], workspace: { id: 2, name: "2" },
-  floating: false, fullscreen: 0, hidden: false, mapped: true, focusHistoryID: 0, stableId: "abc",
-};
+const window = client({ at: [10, 20], size: [300, 200], workspace: { id: 2, name: "2" }, stableId: "abc" });
 const showing = [{ activeWorkspace: { id: 2, name: "2" } }] as HyprMonitor[];
 const elsewhere = [{ activeWorkspace: { id: 1, name: "1" } }] as HyprMonitor[];
 
@@ -33,7 +31,7 @@ describe("capture", () => {
       calls.push([...argv]);
       return { code: 0, stdout: "", stderr: "", bytes: png(300, 200) };
     };
-    const shot = await createCapture(run).window(client, elsewhere);
+    const shot = await createCapture(run).window(window, elsewhere);
     expect(shot.via).toBe("window-buffer");
     expect(calls[0]).toContain("-T");
     expect(shot.geometry).toEqual([10, 20, 300, 200]);
@@ -43,7 +41,7 @@ describe("capture", () => {
     const run: Runner = async (argv) => argv.includes("-T")
       ? { code: 1, stdout: "", stderr: "cannot find toplevel" }
       : { code: 0, stdout: "", stderr: "", bytes: png(300, 200) };
-    const shot = await createCapture(run).window(client, showing);
+    const shot = await createCapture(run).window(window, showing);
     expect(shot.via).toBe("screen-region");
     expect(shot.warnings[0]).toMatch(/covering it would show/);
   });
@@ -52,6 +50,6 @@ describe("capture", () => {
     const run: Runner = async (argv) => argv.includes("-T")
       ? { code: 1, stdout: "", stderr: "cannot find toplevel" }
       : { code: 0, stdout: "", stderr: "", bytes: png(300, 200) };
-    await expect(createCapture(run).window(client, elsewhere)).rejects.toMatchObject({ code: "unavailable" });
+    await expect(createCapture(run).window(window, elsewhere)).rejects.toMatchObject({ code: "unavailable" });
   });
 });

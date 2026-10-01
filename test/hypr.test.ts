@@ -3,13 +3,9 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHypr, encodeIntent, luaString, resolveWindow, socketRequest, windowShown, type HyprClient, type HyprMonitor } from "../src/hypr.js";
-import type { Runner } from "../src/run.js";
+import { createHypr, encodeIntent, luaString, resolveWindow, socketRequest, windowShown, type HyprMonitor } from "../src/hypr.js";
+import { client } from "./helpers/client.js";
 
-const client = (over: Partial<HyprClient>): HyprClient => ({
-  address: "0xa", class: "foot", title: "foot", pid: 1, at: [0, 0], size: [100, 100],
-  workspace: { id: 1, name: "1" }, floating: false, fullscreen: 0, hidden: false, mapped: true, focusHistoryID: 0, ...over,
-});
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -58,6 +54,23 @@ describe("dispatch encoding", () => {
 });
 
 describe("createHypr", () => {
+  it("does not cache a grammar it could not ask about", async () => {
+    let up = false;
+    const sent: string[] = [];
+    const hypr = createHypr({
+      env: {},
+      request: async (command) => {
+        if (!up) throw new Error("socket down");
+        sent.push(command);
+        return command === "j/status" ? '{"configProvider":"lua"}' : "ok";
+      },
+    });
+    await expect(hypr.dispatch({ kind: "workspace", workspace: "2" })).rejects.toThrow("socket down");
+    up = true;
+    await hypr.dispatch({ kind: "workspace", workspace: "2" });
+    expect(sent.at(-1)).toBe("dispatch hl.dsp.focus({ workspace = 2 })");
+  });
+
   it("talks to Hyprland's own socket, and picks the grammar from the config provider once", async () => {
     const hyprland = fakeHyprland((command) => (command === "j/status" ? '{"configProvider":"lua"}' : command === "j/clients" ? "[]" : "ok"));
     const hypr = createHypr({ env: hyprland.env });
@@ -68,10 +81,10 @@ describe("createHypr", () => {
   });
 
   it("treats a refusal as failure and an unknown lock state as unknown", async () => {
-    const run: Runner = async () => ({ code: 1, stdout: "", stderr: "" });
-    const hypr = createHypr({ env: {}, run, request: async (command) => (command === "locked" ? "maybe" : "nope") });
-    await expect(hypr.dispatch({ kind: "focus", address: "0xa" })).rejects.toMatchObject({ code: "failed" });
+    const hypr = createHypr({ env: {}, logind: async () => null, request: async (command) => (command === "locked" ? "maybe" : command === "j/status" ? "{}" : "nope") });
+    await expect(hypr.dispatch({ kind: "focus", address: "0xa" })).rejects.toMatchObject({ code: "failed", details: { refused: "nope" } });
     expect(await hypr.locked()).toBeNull();
+    expect(await createHypr({ env: {}, logind: async () => true, request: async () => "false" }).locked()).toBe(true);
   });
 
   it("waits for a matching event that its own action causes", async () => {

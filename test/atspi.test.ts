@@ -175,16 +175,14 @@ describe("acting by ref", () => {
       .rejects.toMatchObject({ code: "invalid", message: expect.stringContaining("focus it and type instead") });
   });
 
-  it("re-reads one element fresh", async () => {
-    const r = await ref("Search");
-    nodes["/b1"]!.name = "Find";
-    expect(await atspi.element(r)).toMatchObject({ ref: r, name: "Find", box: [110, 220, 30, 40] });
+  it("reads a ref's current window-relative extents and its owner", async () => {
+    expect(await atspi.extents(await ref("Search"))).toEqual({ box: [10, 20, 30, 40], pid: 4242 });
   });
 
   it("refuses unknown refs and reports vanished elements", async () => {
     await expect(atspi.perform("e999999")).rejects.toMatchObject({ code: "not_found" });
     const r = await ref("Search");
     delete nodes["/b1"];
-    await expect(atspi.element(r)).rejects.toMatchObject({ code: "not_found" });
+    await expect(atspi.extents(r)).rejects.toMatchObject({ code: "not_found" });
   });
 });

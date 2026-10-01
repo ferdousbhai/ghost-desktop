@@ -46,12 +46,13 @@ export interface Atspi {
   setText(ref: string, text: string): Promise<void>;
   setValue(ref: string, value: number): Promise<void>;
   focus(ref: string): Promise<void>;
-  element(ref: string): Promise<AxElement>;
+  /** A ref's current window-relative box, and the pid owning it, for aiming the pointer. */
+  extents(ref: string): Promise<{ box?: [number, number, number, number]; pid: number }>;
   close(): Promise<void>;
 }
 
 /** The rounded center of an element's box, where a pointer click lands. */
-export function centerOf(element: AxElement): [number, number] | undefined {
+export function centerOf(element: Pick<AxElement, "box">): [number, number] | undefined {
   if (!element.box) return undefined;
   const [x, y, width, height] = element.box;
   return [Math.round(x + width / 2), Math.round(y + height / 2)];
@@ -131,12 +132,12 @@ function unwrap(value: DBusValue | undefined): DBusValue {
 interface Target {
   readonly bus: string;
   readonly path: string;
-  readonly at: readonly [number, number];
 }
 
 interface Node extends Target {
   readonly depth: number;
   readonly element: Omit<AxElement, "ref">;
+  readonly hasText: boolean;
   readonly children: Node[];
 }
 
@@ -201,11 +202,21 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
     if (inFlight >= MAX_IN_FLIGHT) await new Promise<void>((resolve) => waiting.push(resolve));
     inFlight++;
     try {
-      return await conn.call({ destination: target.bus, path: target.path, interface: iface, member, ...(signature ? { signature, body } : {}), timeoutMs: CALL_TIMEOUT_MS });
+      return await conn.call({ destination: target.bus, path: target.path, interface: iface, member, ...(signature ? { signature, body } : {}) });
     } finally {
       inFlight--;
       waiting.shift()?.();
     }
+  }
+
+  async function actionNames(conn: DBusConnection, target: Target): Promise<string[]> {
+    const [list] = await call(conn, target, ACTION, "GetActions");
+    return (list as DBusValue[][]).map((entry) => String(entry[0]));
+  }
+
+  async function text(conn: DBusConnection, target: Target): Promise<string> {
+    const [value] = await call(conn, target, TEXT, "GetText", "ii", [0, MAX_TEXT]);
+    return String(value);
   }
 
   async function property(conn: DBusConnection, target: { bus: string; path: string }, iface: string, name: string): Promise<DBusValue> {
@@ -238,8 +249,11 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
     return target;
   }
 
-  /** Read one element; `children` is its child list for the walk. */
-  async function read(conn: DBusConnection, target: Target): Promise<{ element: Omit<AxElement, "ref">; children: Array<[string, string]> }> {
+  /**
+   * Read one element at window origin `at`; `children` is its child list for
+   * the walk. Text is read only when `withText`, since it can be a document.
+   */
+  async function read(conn: DBusConnection, target: Target, at: readonly [number, number], withText: boolean): Promise<{ element: Omit<AxElement, "ref">; hasText: boolean; children: Array<[string, string]> }> {
     // Extents need no interface check (a non-component just errors), so they ride the first round.
     const [[role], name, [state], [children], [interfaces], extents] = await Promise.all([
       call(conn, target, ACCESSIBLE, "GetRoleName"),
@@ -255,12 +269,12 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
     const element: Omit<AxElement, "ref"> = { role: roleName, name: String(name ?? ""), states, actions: [] };
     if (extents) {
       const [x, y, width, height] = extents.map(Number) as [number, number, number, number];
-      if (width > 0 || height > 0) element.box = [x + target.at[0], y + target.at[1], width, height];
+      if (width > 0 || height > 0) element.box = [x + at[0], y + at[1], width, height];
     }
     const extras: Promise<unknown>[] = [];
     if (has.has(ACTION)) {
-      extras.push(call(conn, target, ACTION, "GetActions").then(([list]) => {
-        element.actions = (list as DBusValue[][]).map((entry) => String(entry[0]));
+      extras.push(actionNames(conn, target).then((names) => {
+        element.actions = names;
       }, () => undefined));
     }
     if (has.has(VALUE)) {
@@ -268,26 +282,26 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
         element.value = Number(value);
       }, () => undefined));
     }
-    if (has.has(TEXT) && roleName !== "password text") {
-      extras.push(call(conn, target, TEXT, "GetText", "ii", [0, MAX_TEXT]).then(([text]) => {
-        const value = String(text);
+    const hasText = has.has(TEXT) && roleName !== "password text";
+    if (hasText && withText) {
+      extras.push(text(conn, target).then((value) => {
         if (value && value !== element.name) element.text = value;
       }, () => undefined));
     }
     await Promise.all(extras);
     // GTK4 reports a toggle's on state as `pressed`, not `checked`.
     if (CHECKABLE_ROLES.has(roleName) || states.includes("checkable")) element.checked = states.includes("checked") || states.includes("pressed");
-    return { element, children: (children as DBusValue[][]).map((c) => [String(c[0]), String(c[1])]) };
+    return { element, hasText, children: (children as DBusValue[][]).map((c) => [String(c[0]), String(c[1])]) };
   }
 
-  async function walk(conn: DBusConnection, roots: Target[]): Promise<Node[]> {
+  async function walk(conn: DBusConnection, roots: Target[], at: readonly [number, number], withText: boolean): Promise<Node[]> {
     let budget = MAX_NODES;
     const visit = async (target: Target, depth: number): Promise<Node | null> => {
       if (budget <= 0) return null;
       budget--;
       let read_: Awaited<ReturnType<typeof read>>;
       try {
-        read_ = await read(conn, target);
+        read_ = await read(conn, target, at, withText);
       } catch (error) {
         if (error instanceof DBusError && error.dbusName === "org.ghost.Disconnected") throw error;
         return null;
@@ -295,9 +309,9 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
       // A hidden element's subtree is not on screen; skip it.
       const expand = depth < MAX_DEPTH && !(depth > 0 && !read_.element.states.includes("showing"));
       const children = expand
-        ? (await Promise.all(read_.children.map(([b, p]) => visit({ bus: b, path: p, at: target.at }, depth + 1)))).filter((n): n is Node => n !== null)
+        ? (await Promise.all(read_.children.map(([b, p]) => visit({ bus: b, path: p }, depth + 1)))).filter((n): n is Node => n !== null)
         : [];
-      return { ...target, depth, element: read_.element, children };
+      return { ...target, depth, element: read_.element, hasText: read_.hasText, children };
     };
     return (await Promise.all(roots.map((root) => visit(root, 0)))).filter((n): n is Node => n !== null);
   }
@@ -332,9 +346,9 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
         { pid: window.pid },
       );
     }
-    const appTarget = { bus: String(app[0]), path: String(app[1]), at: window.at };
+    const appTarget = { bus: String(app[0]), path: String(app[1]) };
     const [frames] = await call(conn, appTarget, ACCESSIBLE, "GetChildren") as [DBusValue[][]];
-    const targets = frames.map(([b, p]) => ({ bus: String(b), path: String(p), at: window.at }));
+    const targets = frames.map(([b, p]) => ({ bus: String(b), path: String(p) }));
     if (targets.length <= 1 || !window.title) return targets.length ? targets : [appTarget];
     const names = await Promise.all(targets.map((t) => property(conn, t, ACCESSIBLE, "Name").then(String, () => "")));
     const exact = targets.filter((_, i) => names[i] === window.title);
@@ -390,16 +404,22 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
   return {
     async query(window, query) {
       const conn = await bus();
-      const nodes = flatten(await walk(conn, await windowRoots(conn, window)));
+      // Text is matched only when the query asks; otherwise it is read for the returned few.
+      const nodes = flatten(await walk(conn, await windowRoots(conn, window), window.at, !!query.text));
       const roles: Record<string, number> = {};
       for (const node of nodes) roles[node.element.role] = (roles[node.element.role] ?? 0) + 1;
       const matched = nodes.filter((node) => node.depth > 0 || nodes.length === 1).filter((node) => matches(node, query));
-      return { elements: matched.slice(0, query.limit).map((node) => ({ ref: mint(node), ...node.element })), total: matched.length, roles };
+      const shown = matched.slice(0, query.limit);
+      if (!query.text) {
+        await Promise.all(shown.filter((node) => node.hasText).map((node) => text(conn, node).then((value) => {
+          if (value && value !== node.element.name) node.element.text = value;
+        }, () => undefined)));
+      }
+      return { elements: shown.map((node) => ({ ref: mint(node), ...node.element })), total: matched.length, roles };
     },
 
     perform: (ref, action) => withTarget(ref, "click its coordinates instead", async (conn, target) => {
-      const [list] = await call(conn, target, ACTION, "GetActions").catch(() => [[]] as DBusValue[]);
-      const names = (list as DBusValue[][]).map((entry) => String(entry[0]));
+      const names = await actionNames(conn, target).catch(() => [] as string[]);
       if (!names.length) throw new DesktopError("invalid", `Element ${ref} has no actions; click its coordinates instead.`, { ref });
       let index: number;
       if (action) {
@@ -426,9 +446,10 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
       if (ok === false) throw new DesktopError("failed", `Element ${ref} would not take focus.`, { ref });
     }),
 
-    element: (ref) => withTarget(ref, "run look with ui again", async (conn, target) => {
-      const { element } = await read(conn, target);
-      return { ref, ...element };
+    extents: (ref) => withTarget(ref, "click by x and y from an image instead", async (conn, target) => {
+      const [[extents], pid] = await Promise.all([call(conn, target, COMPONENT, "GetExtents", "u", [COORD_WINDOW]), pidOf(conn, target.bus)]);
+      const [x, y, width, height] = (extents as number[]).map(Number) as [number, number, number, number];
+      return { pid, ...(width > 0 || height > 0 ? { box: [x, y, width, height] as [number, number, number, number] } : {}) };
     }),
 
     async close() {

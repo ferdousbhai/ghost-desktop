@@ -115,7 +115,7 @@ function observationContent(observation: Observation, lead?: Record<string, unkn
 
 /** The text leads with the code for a reader; `_meta` carries it, with details, for a program. */
 function errorResult(error: unknown, lead?: Record<string, unknown>): CallToolResult {
-  const failure = error instanceof DesktopError ? error : new DesktopError("failed", error instanceof Error ? error.message : String(error));
+  const failure = DesktopError.from(error);
   const message = `${failure.code}: ${failure.message}`;
   return {
     content: [{ type: "text", text: lead ? `${JSON.stringify(lead)}\n${message}` : message }],

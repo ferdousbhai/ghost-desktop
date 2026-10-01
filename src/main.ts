@@ -10,8 +10,11 @@ import { runCommand } from "./run.js";
 import { createServer } from "./server.js";
 import { openVirtualPointer } from "./wayland.js";
 
+// The runtime build stamps the release version; a source checkout reads its manifest.
+const version = process.env.GHOSTD_VERSION ?? packageJson.version;
+
 if (process.argv.includes("--version")) {
-  console.log(packageJson.version);
+  console.log(version);
   process.exit(0);
 }
 
@@ -24,7 +27,7 @@ const desktop = createDesktop({
   lease: new DesktopLease(leaseDir(env)),
   run: runCommand,
 });
-const server = createServer(desktop, packageJson.version);
+const server = createServer(desktop, version);
 const { promise: closed, resolve } = Promise.withResolvers<void>();
 server.onclose = resolve;
 process.stdin.once("end", () => void server.close().then(resolve, resolve));

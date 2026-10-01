@@ -1,5 +1,5 @@
 import { DesktopError } from "./errors.js";
-import { windowShown, type HyprClient, type HyprMonitor } from "./hypr.js";
+import { logicalSize, windowShown, type HyprClient, type HyprMonitor } from "./hypr.js";
 import { runChecked, runCommand, type Runner } from "./run.js";
 
 export interface Shot {
@@ -90,7 +90,7 @@ export function createCapture(run: Runner = runCommand) {
     },
 
     monitor(monitor: HyprMonitor, options: CaptureOptions = {}): Promise<Shot> {
-      const geometry = [monitor.x, monitor.y, Math.round(monitor.width / monitor.scale), Math.round(monitor.height / monitor.scale)] as const;
+      const geometry = [monitor.x, monitor.y, ...logicalSize(monitor)] as const;
       return grim(["-o", monitor.name], options, geometry, "monitor");
     },
 

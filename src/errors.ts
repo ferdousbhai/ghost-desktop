@@ -20,4 +20,9 @@ export class DesktopError extends Error {
     super(message);
     this.name = "DesktopError";
   }
+
+  /** Any thrown value as a DesktopError; one that is not already is `failed`. */
+  static from(error: unknown): DesktopError {
+    return error instanceof DesktopError ? error : new DesktopError("failed", error instanceof Error ? error.message : String(error));
+  }
 }

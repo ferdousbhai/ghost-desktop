@@ -11,7 +11,7 @@
 import type { Socket } from "node:net";
 import { join } from "node:path";
 import { DesktopError } from "./errors.js";
-import { connectUnix, runtimeDir } from "./session.js";
+import { ByteQueue, connectUnix, runtimeDir } from "./session.js";
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -36,7 +36,7 @@ export const PTR_AXIS = 3;
 export const PTR_FRAME = 4;
 export const PTR_AXIS_SOURCE = 5;
 export const PTR_AXIS_DISCRETE = 7;
-const PTR_DESTROY = 8;
+export const PTR_DESTROY = 8;
 
 export const MANAGER_INTERFACE = "zwlr_virtual_pointer_manager_v1";
 const BUTTON_CODES: Record<MouseButton, number> = { left: 0x110, right: 0x111, middle: 0x112 };
@@ -131,10 +131,7 @@ function socketPath(env: NodeJS.ProcessEnv): string {
 }
 
 class Connection {
-  // Unparsed bytes live in buffer[head, tail); a chunk is appended, never re-copied with the tail.
-  private buffer = Buffer.alloc(4096);
-  private head = 0;
-  private tail = 0;
+  private readonly received = new ByteQueue();
   private nextId = 2;
   private failure: DesktopError | undefined;
   private readonly waiters = new Set<() => void>();
@@ -143,10 +140,10 @@ class Connection {
 
   constructor(private readonly socket: Socket) {
     socket.on("data", (chunk: Buffer) => {
-      this.append(chunk);
-      const { events, rest } = parseEvents(this.buffer.subarray(this.head, this.tail));
+      const pending = this.received.push(chunk);
+      const { events, rest } = parseEvents(pending);
       for (const event of events) this.handle(event);
-      this.head = this.tail - rest.length;
+      this.received.consume(pending.length - rest.length);
       this.wake();
     });
     socket.on("close", () => {
@@ -160,19 +157,6 @@ class Connection {
   }
 
   private readonly doneCallbacks = new Set<number>();
-
-  private append(chunk: Buffer): void {
-    const pending = this.tail - this.head;
-    if (this.tail + chunk.length > this.buffer.length) {
-      const next = pending + chunk.length > this.buffer.length ? Buffer.alloc(Math.max(this.buffer.length * 2, pending + chunk.length)) : this.buffer;
-      this.buffer.copy(next, 0, this.head, this.tail);
-      this.buffer = next;
-      this.head = 0;
-      this.tail = pending;
-    }
-    chunk.copy(this.buffer, this.tail);
-    this.tail += chunk.length;
-  }
 
   private handle({ objectId, opcode, body }: WireEvent): void {
     if (objectId === DISPLAY_ID && opcode === EV_ERROR) {

@@ -1,7 +1,7 @@
 import { centerOf, type Atspi, type AxElement } from "./atspi.js";
 import { parseRegion, type Capture, type Shot } from "./capture.js";
 import { DesktopError } from "./errors.js";
-import { resolveWindow, type Hypr, type HyprClient, type HyprMonitor } from "./hypr.js";
+import { logicalSize, resolveWindow, type Hypr, type HyprClient, type HyprMonitor } from "./hypr.js";
 import { parseChord, WTYPE_MODS } from "./keys.js";
 import type { DesktopLease } from "./lease.js";
 import { runChecked, type Runner } from "./run.js";
@@ -175,7 +175,7 @@ export function createDesktop(deps: DesktopDeps) {
         name: monitor.name,
         workspace: monitor.activeWorkspace.name,
         at: [monitor.x, monitor.y],
-        size: [Math.round(monitor.width / monitor.scale), Math.round(monitor.height / monitor.scale)],
+        size: logicalSize(monitor),
         ...(monitor.scale !== 1 ? { scale: monitor.scale } : {}),
         ...(monitor.focused ? { focused: true } : {}),
       })),
@@ -204,29 +204,39 @@ export function createDesktop(deps: DesktopDeps) {
   async function look(args: LookArgs, caller: string): Promise<Observation> {
     const facts: Record<string, unknown> = {};
     const images: Shot[] = [];
-    const target = args.window !== undefined || args.ui === true ? await window(args.window) : undefined;
+    const wantsImage = !!(args.image || args.region || args.monitor);
+    const [target, monitors] = await Promise.all([
+      args.window !== undefined || args.ui === true ? window(args.window) : undefined,
+      wantsImage && !args.region ? hypr.monitors() : [],
+    ]);
     const client = target?.client;
     if (target) facts.window = windowFacts(target.client, target.active);
     else if (!args.image && !args.clipboard) Object.assign(facts, await desktopFacts(caller));
-    if (client && args.ui) {
-      const result = await ax().query(client, {
-        limit: clampInt(args.limit, BOUNDS.elements),
-        actionable: !args.find && !args.role,
-        ...(args.find ? { text: args.find } : {}),
-        ...(args.role ? { role: args.role } : {}),
-      });
-      facts.ui = result.elements.map(elementFacts);
-      if (result.total > result.elements.length) facts.uiOmitted = result.total - result.elements.length;
-      if (result.elements.length === 0 && args.role && !result.roles[args.role]) facts.rolesPresent = result.roles;
-    }
-    if (args.image || args.region || args.monitor) {
-      const frames = clampInt(args.frames, BOUNDS.frames);
-      const interval = clampInt(args.interval_ms, BOUNDS.interval_ms);
-      const monitors = args.region ? [] : await hypr.monitors();
+    const frames = clampInt(args.frames, BOUNDS.frames);
+    const interval = clampInt(args.interval_ms, BOUNDS.interval_ms);
+    const takeShots = async () => {
       for (let index = 0; index < frames; index += 1) {
         if (index) await sleep(interval);
         images.push(await shot(args, client, monitors));
       }
+    };
+    const [result] = await Promise.all([
+      client && args.ui
+        ? ax().query(client, {
+          limit: clampInt(args.limit, BOUNDS.elements),
+          actionable: !args.find && !args.role,
+          ...(args.find ? { text: args.find } : {}),
+          ...(args.role ? { role: args.role } : {}),
+        })
+        : undefined,
+      wantsImage ? takeShots() : undefined,
+    ]);
+    if (result) {
+      facts.ui = result.elements.map(elementFacts);
+      if (result.total > result.elements.length) facts.uiOmitted = result.total - result.elements.length;
+      if (result.elements.length === 0 && args.role && !result.roles[args.role]) facts.rolesPresent = result.roles;
+    }
+    if (wantsImage) {
       const [first] = images;
       if (!first) throw new DesktopError("failed", "No screenshot was taken.");
       facts.image = {
@@ -265,19 +275,26 @@ export function createDesktop(deps: DesktopDeps) {
 
   const refOf = async (step: ActStep) => step.ref ?? (await named(step)).element.ref;
 
-  /** The screen point a click aims at, with the window under it brought forward. */
+  /** The screen point a click aims at, with its window brought forward. */
   async function pointAt(step: ActStep, disturbed: string[]): Promise<[number, number]> {
     if (step.x !== undefined && step.y !== undefined) return [step.x, step.y];
-    const found = step.ref
-      ? await Promise.all([ax().element(step.ref), hypr.clients(), hypr.activeAddress()])
-        .then(([element, clients, active]) => ({ element, active, client: step.window ? resolveWindow(clients, active, step.window) : undefined, clients }))
-      : { ...(await named(step)), clients: undefined };
-    const point = centerOf(found.element);
-    if (!point) throw new DesktopError("unavailable", `${found.element.ref} reports no position; use perform, or click by x and y from an image.`);
-    const [x, y] = point;
-    const client = found.client ?? found.clients?.find((candidate) =>
-      x >= candidate.at[0] && x < candidate.at[0] + candidate.size[0] && y >= candidate.at[1] && y < candidate.at[1] + candidate.size[1]);
-    if (client) await focus(client, found.active, disturbed);
+    let point: [number, number] | undefined;
+    let target: { client: HyprClient; active: string | null };
+    if (step.ref) {
+      // Fresh extents against the window's position now, not when the ref was minted.
+      const [{ box, pid }, clients, active] = await Promise.all([ax().extents(step.ref), hypr.clients(), hypr.activeAddress()]);
+      const owners = clients.filter((client) => client.pid === pid);
+      const client = step.window ? resolveWindow(clients, active, step.window) : owners.find((owner) => owner.address === active) ?? owners[0];
+      if (!client) throw new DesktopError("not_found", `${step.ref} belongs to no open window; look with ui again.`);
+      target = { client, active };
+      point = box && centerOf({ box: [box[0] + client.at[0], box[1] + client.at[1], box[2], box[3]] });
+    } else {
+      const found = await named(step);
+      target = found;
+      point = centerOf(found.element);
+    }
+    if (!point) throw new DesktopError("unavailable", `${step.ref ?? step.name} reports no position; use perform, or click by x and y from an image.`);
+    await focus(target.client, target.active, disturbed);
     return point;
   }
 
@@ -332,7 +349,7 @@ export function createDesktop(deps: DesktopDeps) {
           return report(`sent ${step.keys} to ${client.class}`);
         } catch (error) {
           // Hyprland names keys from the last keyboard's keymap; after a type that is wtype's.
-          if (!(error instanceof DesktopError && error.code === "failed")) throw error;
+          if (!(error instanceof DesktopError && "refused" in error.details)) throw error;
           await focus(client, active, disturbed);
           const mods = chord.mods.map((mod) => WTYPE_MODS[mod]);
           await runChecked(run, ["wtype", ...mods.flatMap((mod) => ["-M", mod]), "-k", chord.keysym, ...mods.flatMap((mod) => ["-m", mod])]);
@@ -455,8 +472,7 @@ export function createDesktop(deps: DesktopDeps) {
           reports.push(await step(item));
           lastWindow = item.window ?? lastWindow;
         } catch (error) {
-          const failure = error instanceof DesktopError ? error : new DesktopError("failed", error instanceof Error ? error.message : String(error));
-          return { steps: reports, failed: { index, error: failure } };
+          return { steps: reports, failed: { index, error: DesktopError.from(error) } };
         }
       }
     } finally {

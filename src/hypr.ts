@@ -1,7 +1,7 @@
 import type { Socket } from "node:net";
 import { join } from "node:path";
+import { DBusConnection, type DBusValue, type Variant } from "./dbus.js";
 import { DesktopError } from "./errors.js";
-import { runCommand, type Runner } from "./run.js";
 import { connectUnix, runtimeDir } from "./session.js";
 
 /** One window as Hyprland reports it, trimmed to what we use. */
@@ -177,14 +177,35 @@ export function socketRequest(env: NodeJS.ProcessEnv): HyprRequest {
   };
 }
 
-/** `hyprctl locked` and logind's LockedHint each answer yes, no, or nothing. */
-const verdict = (text: string | null, yes: RegExp, no: RegExp): boolean | null =>
-  text === null ? null : yes.test(text.trim()) ? true : no.test(text.trim()) ? false : null;
+/**
+ * logind's LockedHint for the owner's graphical session, over the system bus:
+ * `user/self`'s Display session, which also holds for a process a systemd
+ * user unit started outside any session. Null when logind cannot say.
+ */
+export async function logindLocked(env: NodeJS.ProcessEnv): Promise<boolean | null> {
+  let conn: DBusConnection | undefined;
+  try {
+    conn = await DBusConnection.connect(env.DBUS_SYSTEM_BUS_ADDRESS || "unix:path=/run/dbus/system_bus_socket", { timeoutMs: 2000 });
+    const get = async (path: string, iface: string, name: string): Promise<DBusValue> => {
+      const [value] = await (conn as DBusConnection).call({
+        destination: "org.freedesktop.login1", path, interface: "org.freedesktop.DBus.Properties", member: "Get", signature: "ss", body: [iface, name],
+      });
+      return (value as Variant).value;
+    };
+    const [, session] = (await get("/org/freedesktop/login1/user/self", "org.freedesktop.login1.User", "Display")) as [string, string];
+    const locked = await get(String(session), "org.freedesktop.login1.Session", "LockedHint");
+    return typeof locked === "boolean" ? locked : null;
+  } catch {
+    return null;
+  } finally {
+    conn?.close();
+  }
+}
 
-export function createHypr(options: { env?: NodeJS.ProcessEnv; request?: HyprRequest; run?: Runner } = {}): Hypr {
+export function createHypr(options: { env?: NodeJS.ProcessEnv; request?: HyprRequest; logind?: () => Promise<boolean | null> } = {}): Hypr {
   const env = options.env ?? process.env;
   const request = options.request ?? socketRequest(env);
-  const run = options.run ?? runCommand;
+  const logind = options.logind ?? (() => logindLocked(env));
   let lua: boolean | undefined;
 
   const json = async <T>(what: string): Promise<T> => {
@@ -196,11 +217,13 @@ export function createHypr(options: { env?: NodeJS.ProcessEnv; request?: HyprReq
     }
   };
 
-  // `status` names the config manager; before 0.56 it is an unknown request, which means legacy strings.
+  // `status` names the config manager; before 0.56 it is an unknown request,
+  // which means legacy strings. Only an answer is cached: a socket error is not one.
   const provider = async (): Promise<boolean> => {
     if (lua === undefined) {
+      const reply = await request("j/status");
       try {
-        lua = (await json<{ configProvider?: string }>("status")).configProvider === "lua";
+        lua = (JSON.parse(reply) as { configProvider?: string }).configProvider === "lua";
       } catch {
         lua = false;
       }
@@ -224,20 +247,15 @@ export function createHypr(options: { env?: NodeJS.ProcessEnv; request?: HyprReq
       return [pos.x, pos.y];
     },
     async locked() {
-      const session = env.XDG_SESSION_ID ? [env.XDG_SESSION_ID] : [];
-      const [hypr, logind] = await Promise.all([
-        request("locked").catch(() => null),
-        run(["loginctl", "show-session", ...session, "-p", "LockedHint", "--value"], { timeoutMs: 3000 })
-          .then((result) => (result.code === 0 ? result.stdout : null), () => null),
-      ]);
-      const fromHypr = verdict(hypr, /^true$/i, /^false$/i);
-      const fromLogind = verdict(logind, /^(yes|true|1)$/i, /^(no|false|0)$/i);
+      const [reply, fromLogind] = await Promise.all([request("locked").catch(() => null), logind()]);
+      const answer = reply?.trim().toLowerCase();
+      const fromHypr = answer === "true" ? true : answer === "false" ? false : null;
       if (fromHypr === true || fromLogind === true) return true;
       return fromHypr === null && fromLogind === null ? null : false;
     },
     async dispatch(intent) {
       const reply = (await request(`dispatch ${encodeIntent(intent, await provider())}`)).trim();
-      if (reply !== "ok") throw new DesktopError("failed", `Hyprland refused ${intent.kind}: ${reply.slice(0, 200)}`);
+      if (reply !== "ok") throw new DesktopError("failed", `Hyprland refused ${intent.kind}: ${reply.slice(0, 200)}`, { refused: reply });
     },
     async waitEvent(names, { match, timeoutMs, after }) {
       const socket: Socket = await connectUnix(join(socketDir(env), ".socket2.sock"), "Hyprland's event socket");
@@ -291,6 +309,11 @@ export function resolveWindow(clients: readonly HyprClient[], active: string | n
   if (byTitle.length === 0) throw new DesktopError("not_found", `No open window matches ${JSON.stringify(target)}.`);
   // Several matches: the most recently focused one, which is what a person means by "the terminal".
   return byTitle.reduce((best, client) => (client.focusHistoryID < best.focusHistoryID ? client : best));
+}
+
+/** A monitor's size in desktop (logical) units. */
+export function logicalSize(monitor: HyprMonitor): [number, number] {
+  return [Math.round(monitor.width / monitor.scale), Math.round(monitor.height / monitor.scale)];
 }
 
 /** Whether any monitor currently shows the window's workspace. */
