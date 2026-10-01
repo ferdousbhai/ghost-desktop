@@ -1,22 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import net from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createAtspi, type Atspi, type AxWindow } from "../src/atspi.js";
-import { decodeMessages, encodeMessage, MessageType, variant, type DBusMessage, type DBusValue } from "../src/dbus.js";
-
-const STATE_BITS = ["invalid", "active", "armed", "busy", "checked", "collapsed", "defunct", "editable",
-  "enabled", "expandable", "expanded", "focusable", "focused", "has_tooltip", "horizontal", "iconified",
-  "modal", "multi_line", "multiselectable", "opaque", "pressed", "resizable", "selectable", "selected",
-  "sensitive", "showing", "single_line", "stale", "transient", "vertical", "visible", "manages_descendants",
-  "indeterminate", "required", "truncated", "animated", "invalid_entry", "supports_autocompletion", "selectable_text", "is_default",
-  "visited", "checkable", "has_popup", "read_only"];
+import { centerOf, createAtspi, STATE_NAMES, type Atspi, type AxWindow } from "../src/atspi.js";
+import { variant, type DBusMessage, type DBusValue } from "../src/dbus.js";
+import { fakeBus, type FakeBus, type FakeReply } from "./helpers/fake-bus.js";
 
 function stateWords(names: string[]): number[] {
   const words = [0, 0];
   for (const name of names) {
-    const bit = STATE_BITS.indexOf(name);
+    const bit = (STATE_NAMES as readonly string[]).indexOf(name);
     words[bit >> 5]! += 2 ** (bit & 31);
   }
   return words;
@@ -53,16 +43,12 @@ function tree(): Record<string, FakeNode> {
   };
 }
 
-type Reply = { signature?: string; body?: DBusValue[] } | { error: string; text: string };
-
-let dir = "";
-let server: net.Server;
-let address = "";
+let bus: FakeBus;
 let nodes: Record<string, FakeNode>;
 let calls: string[];
 let atspi: Atspi;
 
-function answer(m: DBusMessage, self: string): Reply {
+function answer(m: DBusMessage, self: string): FakeReply {
   const body = m.body ?? [];
   if (m.interface === "org.a11y.Bus") return { signature: "s", body: [self] };
   if (m.member === "GetConnectionUnixProcessID") return { signature: "u", body: [body[0] === APP ? 4242 : 1] };
@@ -104,52 +90,24 @@ function answer(m: DBusMessage, self: string): Reply {
 beforeEach(async () => {
   nodes = tree();
   calls = [];
-  dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "atspi-"));
-  const path = join(dir, "bus");
-  address = `unix:path=${path}`;
-  let serial = 5000;
-  server = net.createServer((socket) => {
-    let authed = false;
-    let buffer: Uint8Array = new Uint8Array(0);
-    socket.on("data", (chunk: Buffer) => {
-      if (!authed) {
-        const text = chunk.toString("latin1");
-        if (text.includes("AUTH")) socket.write("OK 0123456789abcdef\r\n");
-        if (!text.includes("BEGIN")) return;
-        authed = true;
-        chunk = Buffer.from(text.slice(text.indexOf("BEGIN\r\n") + 7), "latin1");
-      }
-      const joined = new Uint8Array(buffer.length + chunk.length);
-      joined.set(buffer);
-      joined.set(chunk, buffer.length);
-      const { messages, rest } = decodeMessages(joined);
-      buffer = rest;
-      for (const m of messages) {
-        const reply: Reply = m.member === "Hello" ? { signature: "s", body: [":1.77"] } : answer(m, address);
-        socket.write("error" in reply
-          ? encodeMessage({ type: MessageType.Error, serial: ++serial, replySerial: m.serial, errorName: reply.error, signature: "s", body: [reply.text] })
-          : encodeMessage({ type: MessageType.MethodReturn, serial: ++serial, replySerial: m.serial, ...(reply.signature ? { signature: reply.signature, body: reply.body ?? [] } : {}) }));
-      }
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(path, resolve));
-  atspi = createAtspi({ env: { DBUS_SESSION_BUS_ADDRESS: address } });
+  bus = await fakeBus((m) => answer(m, bus.address));
+  atspi = createAtspi({ DBUS_SESSION_BUS_ADDRESS: bus.address });
 });
 
 afterEach(async () => {
   await atspi.close();
-  server.close();
-  rmSync(dir, { recursive: true, force: true });
+  bus.close();
 });
 
-const WINDOW: AxWindow = { pid: 4242, at: [100, 200], address: "0xabc", title: "Files" };
+const WINDOW: AxWindow = { pid: 4242, at: [100, 200], title: "Files" };
 
 describe("query", () => {
   it("returns the window's actionable elements in screen coordinates, skipping hidden subtrees", async () => {
     const result = await atspi.query(WINDOW, { actionable: true, limit: 50 });
     const names = result.elements.map((e) => e.name);
     expect(names).toEqual(["Search", "Query", "Volume", "Bold"]);
-    expect(result.elements[0]).toMatchObject({ role: "push button", x: 110, y: 220, width: 30, height: 40, actions: ["click"] });
+    expect(result.elements[0]).toMatchObject({ role: "push button", box: [110, 220, 30, 40], actions: ["click"] });
+    expect(centerOf(result.elements[0]!)).toEqual([125, 240]);
     expect(result.elements[0]!.ref).toMatch(/^e\d+$/);
     expect(result.elements[1]).toMatchObject({ text: "hello", states: expect.arrayContaining(["editable", "focused"]) });
     expect(result.elements[2]).toMatchObject({ value: 0.5 });
@@ -159,10 +117,9 @@ describe("query", () => {
     expect(result.roles).toMatchObject({ frame: 1, "push button": 1, panel: 1 });
   });
 
-  it("filters by text, role, and state, and caps by limit while counting the total", async () => {
+  it("filters by text and role, and caps by limit while counting the total", async () => {
     expect((await atspi.query(WINDOW, { text: "HELLO", limit: 5 })).elements.map((e) => e.name)).toEqual(["Query"]);
     expect((await atspi.query(WINDOW, { role: "button", limit: 5 })).elements.map((e) => e.name)).toEqual(["Search"]);
-    expect((await atspi.query(WINDOW, { states: ["focused"], limit: 5 })).elements.map((e) => e.name)).toEqual(["Query"]);
     const capped = await atspi.query(WINDOW, { actionable: true, limit: 2 });
     expect(capped.elements).toHaveLength(2);
     expect(capped.total).toBe(4);
@@ -185,7 +142,7 @@ describe("query", () => {
   });
 
   it("says how to start an unreachable bus", async () => {
-    const dead = createAtspi({ env: { DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent/bus" } });
+    const dead = createAtspi({ DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent/bus" });
     await expect(dead.query(WINDOW, { limit: 5 }))
       .rejects.toMatchObject({ code: "unavailable", message: expect.stringContaining("at-spi-bus-launcher") });
   });
@@ -221,7 +178,7 @@ describe("acting by ref", () => {
   it("re-reads one element fresh", async () => {
     const r = await ref("Search");
     nodes["/b1"]!.name = "Find";
-    expect(await atspi.element(r)).toMatchObject({ ref: r, name: "Find", x: 110 });
+    expect(await atspi.element(r)).toMatchObject({ ref: r, name: "Find", box: [110, 220, 30, 40] });
   });
 
   it("refuses unknown refs and reports vanished elements", async () => {
@@ -229,19 +186,5 @@ describe("acting by ref", () => {
     const r = await ref("Search");
     delete nodes["/b1"];
     await expect(atspi.element(r)).rejects.toMatchObject({ code: "not_found" });
-  });
-});
-
-describe("hit testing and focus", () => {
-  it("finds the smallest element under a screen point", async () => {
-    expect(await atspi.at(WINDOW, 115, 225)).toMatchObject({ name: "Search" });
-    expect(await atspi.at(WINDOW, 400, 500)).toMatchObject({ role: "frame" });
-    expect(await atspi.at(WINDOW, 5000, 5000)).toBeNull();
-  });
-
-  it("returns the focused editable element", async () => {
-    expect(await atspi.focusedEditable(WINDOW)).toMatchObject({ name: "Query", text: "hello" });
-    nodes["/t1"]!.states = SHOWN;
-    expect(await atspi.focusedEditable(WINDOW)).toBeNull();
   });
 });

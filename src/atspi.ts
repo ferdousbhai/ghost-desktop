@@ -4,13 +4,12 @@
  * screen coordinates: AT-SPI's window-relative extents plus the window's
  * Hyprland position, because Wayland clients cannot report screen positions.
  */
-import { DBusConnection, DBusError, sessionBusAddress, variant, type DBusValue } from "./dbus.js";
+import { DBusConnection, DBusError, sessionBusAddress, variant, type DBusValue, type Variant } from "./dbus.js";
 import { DesktopError } from "./errors.js";
 
 export interface AxWindow {
   readonly pid: number;
   readonly at: readonly [number, number];
-  readonly address: string;
   /** The window title; picks the right frame when one process owns several windows. */
   readonly title?: string;
 }
@@ -21,10 +20,8 @@ export interface AxElement {
   name: string;
   states: string[];
   actions: string[];
-  x?: number;
-  y?: number;
-  width?: number;
-  height?: number;
+  /** Screen x, y, width, height. */
+  box?: [number, number, number, number];
   value?: number;
   text?: string;
   checked?: boolean;
@@ -33,7 +30,6 @@ export interface AxElement {
 export interface AxQuery {
   role?: string;
   text?: string;
-  states?: string[];
   actionable?: boolean;
   limit: number;
 }
@@ -51,18 +47,14 @@ export interface Atspi {
   setValue(ref: string, value: number): Promise<void>;
   focus(ref: string): Promise<void>;
   element(ref: string): Promise<AxElement>;
-  at(window: AxWindow, x: number, y: number): Promise<AxElement | null>;
-  focusedEditable(window: AxWindow): Promise<AxElement | null>;
   close(): Promise<void>;
 }
 
-export interface AtspiOptions {
-  readonly env?: NodeJS.ProcessEnv;
-  /** Skip the children of elements that are not `showing` (default true). */
-  readonly showingOnly?: boolean;
-  readonly maxNodes?: number;
-  readonly maxDepth?: number;
-  readonly callTimeoutMs?: number;
+/** The rounded center of an element's box, where a pointer click lands. */
+export function centerOf(element: AxElement): [number, number] | undefined {
+  if (!element.box) return undefined;
+  const [x, y, width, height] = element.box;
+  return [Math.round(x + width / 2), Math.round(y + height / 2)];
 }
 
 const ACCESSIBLE = "org.a11y.atspi.Accessible";
@@ -71,21 +63,28 @@ const ACTION = "org.a11y.atspi.Action";
 const VALUE = "org.a11y.atspi.Value";
 const TEXT = "org.a11y.atspi.Text";
 const EDITABLE_TEXT = "org.a11y.atspi.EditableText";
+const PROPERTIES = "org.freedesktop.DBus.Properties";
 const REGISTRY = "org.a11y.atspi.Registry";
 const ROOT_PATH = "/org/a11y/atspi/accessible/root";
 const COORD_WINDOW = 1;
-const MAX_TEXT = 500;
+const MAX_NODES = 4000;
+const MAX_DEPTH = 60;
+const CALL_TIMEOUT_MS = 2000;
+/** Calls in flight at once, so a big tree never queues thousands of pending calls and timers. */
+const MAX_IN_FLIGHT = 32;
+/** A safety bound on text transferred per element; the caller trims for display. */
+const MAX_TEXT = 4000;
 const MAX_REFS = 5000;
 
 /** AT-SPI's StateType enum, in bit order. */
-const STATES = [
+export const STATE_NAMES = [
   "invalid", "active", "armed", "busy", "checked", "collapsed", "defunct", "editable",
   "enabled", "expandable", "expanded", "focusable", "focused", "has_tooltip", "horizontal", "iconified",
   "modal", "multi_line", "multiselectable", "opaque", "pressed", "resizable", "selectable", "selected",
   "sensitive", "showing", "single_line", "stale", "transient", "vertical", "visible", "manages_descendants",
   "indeterminate", "required", "truncated", "animated", "invalid_entry", "supports_autocompletion", "selectable_text", "is_default",
   "visited", "checkable", "has_popup", "read_only",
-];
+] as const;
 
 const INTERACTIVE_ROLES = new Set([
   "push button", "button", "toggle button", "check box", "radio button", "menu item", "check menu item",
@@ -99,7 +98,7 @@ const PASSIVE_ROLES = new Set(["generic", "label", "panel", "filler", "grouping"
 const CHECKABLE_ROLES = new Set(["check box", "toggle button", "radio button", "check menu item", "radio menu item", "switch"]);
 const DEFAULT_ACTIONS = ["click", "press", "activate", "toggle", "open", "jump"];
 
-export const CHROMIUM_HINT =
+const CHROMIUM_HINT =
   "Chromium and Electron apps expose their tree only when relaunched with --force-renderer-accessibility=complete";
 
 function unreachableBus(detail: string): DesktopError {
@@ -114,15 +113,19 @@ function unreachableBus(detail: string): DesktopError {
 function stateNames(words: DBusValue): string[] {
   const list = Array.isArray(words) ? words.map((w) => Number(w)) : [];
   const names: string[] = [];
-  list.forEach((word, i) => {
+  for (const [i, word] of list.entries()) {
     for (let bit = 0; bit < 32; bit++) {
       if (word & (2 ** bit)) {
-        const name = STATES[i * 32 + bit];
+        const name = STATE_NAMES[i * 32 + bit];
         if (name && name !== "invalid") names.push(name);
       }
     }
-  });
+  }
   return names;
+}
+
+function unwrap(value: DBusValue | undefined): DBusValue {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Variant).value : (value as DBusValue);
 }
 
 interface Target {
@@ -137,41 +140,33 @@ interface Node extends Target {
   readonly children: Node[];
 }
 
-function contains(element: Omit<AxElement, "ref">, x: number, y: number): boolean {
-  const { x: ex, y: ey, width, height } = element;
-  if (ex === undefined || ey === undefined || width === undefined || height === undefined) return false;
-  if (width <= 0 || height <= 0) return false;
-  return x >= ex && y >= ey && x < ex + width && y < ey + height;
-}
-
 function flatten(roots: Node[]): Node[] {
   const out: Node[] = [];
   const visit = (node: Node) => {
     out.push(node);
     for (const child of node.children) visit(child);
   };
-  roots.forEach(visit);
+  for (const root of roots) visit(root);
   return out;
 }
 
-export function createAtspi(options: AtspiOptions = {}): Atspi {
-  const env = options.env ?? process.env;
-  const showingOnly = options.showingOnly ?? true;
-  const maxNodes = options.maxNodes ?? 4000;
-  const maxDepth = options.maxDepth ?? 60;
-  const timeoutMs = options.callTimeoutMs ?? 2000;
-
+export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
   let connecting: Promise<DBusConnection> | null = null;
+  // A connection's PID per unique bus name; unique names are never reused, so
+  // it holds for the life of the connection and is dropped with it.
+  let pids = new Map<string, number>();
   const refs = new Map<string, Target>();
   const refByKey = new Map<string, string>();
   let nextRef = 1;
+  let inFlight = 0;
+  const waiting: Array<() => void> = [];
 
   async function openBus(): Promise<DBusConnection> {
     let address = env.AT_SPI_BUS_ADDRESS;
     if (!address) {
       let session: DBusConnection;
       try {
-        session = await DBusConnection.connect(sessionBusAddress(env), { timeoutMs });
+        session = await DBusConnection.connect(sessionBusAddress(env), { timeoutMs: CALL_TIMEOUT_MS });
       } catch (error) {
         throw unreachableBus(`no session bus: ${(error as Error).message}`);
       }
@@ -185,7 +180,9 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
       }
     }
     try {
-      return await DBusConnection.connect(address, { timeoutMs });
+      const conn = await DBusConnection.connect(address, { timeoutMs: CALL_TIMEOUT_MS });
+      pids = new Map();
+      return conn;
     } catch (error) {
       throw unreachableBus((error as Error).message);
     }
@@ -200,8 +197,20 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
     return connecting;
   }
 
-  function call(conn: DBusConnection, target: { bus: string; path: string }, iface: string, member: string, signature = "", body: DBusValue[] = []) {
-    return conn.call({ destination: target.bus, path: target.path, interface: iface, member, ...(signature ? { signature, body } : {}), timeoutMs });
+  async function call(conn: DBusConnection, target: { bus: string; path: string }, iface: string, member: string, signature = "", body: DBusValue[] = []): Promise<DBusValue[]> {
+    if (inFlight >= MAX_IN_FLIGHT) await new Promise<void>((resolve) => waiting.push(resolve));
+    inFlight++;
+    try {
+      return await conn.call({ destination: target.bus, path: target.path, interface: iface, member, ...(signature ? { signature, body } : {}), timeoutMs: CALL_TIMEOUT_MS });
+    } finally {
+      inFlight--;
+      waiting.shift()?.();
+    }
+  }
+
+  async function property(conn: DBusConnection, target: { bus: string; path: string }, iface: string, name: string): Promise<DBusValue> {
+    const [value] = await call(conn, target, PROPERTIES, "Get", "ss", [iface, name]);
+    return unwrap(value);
   }
 
   function mint(target: Target): string {
@@ -231,38 +240,38 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
 
   /** Read one element; `children` is its child list for the walk. */
   async function read(conn: DBusConnection, target: Target): Promise<{ element: Omit<AxElement, "ref">; children: Array<[string, string]> }> {
-    const [[role], name, [state], [children], [interfaces]] = await Promise.all([
+    // Extents need no interface check (a non-component just errors), so they ride the first round.
+    const [[role], name, [state], [children], [interfaces], extents] = await Promise.all([
       call(conn, target, ACCESSIBLE, "GetRoleName"),
-      conn.getProperty(target.bus, target.path, ACCESSIBLE, "Name").catch(() => ""),
+      property(conn, target, ACCESSIBLE, "Name").catch(() => ""),
       call(conn, target, ACCESSIBLE, "GetState"),
       call(conn, target, ACCESSIBLE, "GetChildren").catch(() => [[]] as DBusValue[]),
       call(conn, target, ACCESSIBLE, "GetInterfaces").catch(() => [[]] as DBusValue[]),
+      call(conn, target, COMPONENT, "GetExtents", "u", [COORD_WINDOW]).then(([ext]) => ext as number[], () => undefined),
     ]);
     const has = new Set((interfaces as DBusValue[]).map(String));
     const roleName = String(role);
     const states = stateNames(state as DBusValue);
     const element: Omit<AxElement, "ref"> = { role: roleName, name: String(name ?? ""), states, actions: [] };
-    const extras: Promise<unknown>[] = [];
-    if (has.has(COMPONENT)) {
-      extras.push(call(conn, target, COMPONENT, "GetExtents", "u", [COORD_WINDOW]).then(([ext]) => {
-        const [x, y, width, height] = (ext as number[]).map(Number) as [number, number, number, number];
-        if (width > 0 || height > 0) Object.assign(element, { x: x + target.at[0], y: y + target.at[1], width, height });
-      }, () => undefined));
+    if (extents) {
+      const [x, y, width, height] = extents.map(Number) as [number, number, number, number];
+      if (width > 0 || height > 0) element.box = [x + target.at[0], y + target.at[1], width, height];
     }
+    const extras: Promise<unknown>[] = [];
     if (has.has(ACTION)) {
       extras.push(call(conn, target, ACTION, "GetActions").then(([list]) => {
         element.actions = (list as DBusValue[][]).map((entry) => String(entry[0]));
       }, () => undefined));
     }
     if (has.has(VALUE)) {
-      extras.push(conn.getProperty(target.bus, target.path, VALUE, "CurrentValue").then((value) => {
+      extras.push(property(conn, target, VALUE, "CurrentValue").then((value) => {
         element.value = Number(value);
       }, () => undefined));
     }
     if (has.has(TEXT) && roleName !== "password text") {
-      extras.push(call(conn, target, TEXT, "GetText", "ii", [0, -1]).then(([text]) => {
+      extras.push(call(conn, target, TEXT, "GetText", "ii", [0, MAX_TEXT]).then(([text]) => {
         const value = String(text);
-        if (value && value !== element.name) element.text = value.slice(0, MAX_TEXT);
+        if (value && value !== element.name) element.text = value;
       }, () => undefined));
     }
     await Promise.all(extras);
@@ -272,7 +281,7 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
   }
 
   async function walk(conn: DBusConnection, roots: Target[]): Promise<Node[]> {
-    let budget = maxNodes;
+    let budget = MAX_NODES;
     const visit = async (target: Target, depth: number): Promise<Node | null> => {
       if (budget <= 0) return null;
       budget--;
@@ -283,13 +292,27 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
         if (error instanceof DBusError && error.dbusName === "org.ghost.Disconnected") throw error;
         return null;
       }
-      const expand = depth < maxDepth && !(showingOnly && depth > 0 && !read_.element.states.includes("showing"));
+      // A hidden element's subtree is not on screen; skip it.
+      const expand = depth < MAX_DEPTH && !(depth > 0 && !read_.element.states.includes("showing"));
       const children = expand
         ? (await Promise.all(read_.children.map(([b, p]) => visit({ bus: b, path: p, at: target.at }, depth + 1)))).filter((n): n is Node => n !== null)
         : [];
       return { ...target, depth, element: read_.element, children };
     };
     return (await Promise.all(roots.map((root) => visit(root, 0)))).filter((n): n is Node => n !== null);
+  }
+
+  async function pidOf(conn: DBusConnection, name: string): Promise<number> {
+    const known = pids.get(name);
+    if (known !== undefined) return known;
+    try {
+      const [value] = await call(conn, { bus: "org.freedesktop.DBus", path: "/org/freedesktop/DBus" }, "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", [name]);
+      const pid = Number(value);
+      pids.set(name, pid);
+      return pid;
+    } catch {
+      return -1;
+    }
   }
 
   /** The application's frames for this window, as walk roots. */
@@ -300,19 +323,8 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
     } catch (error) {
       throw unreachableBus(`the registry did not answer: ${(error as Error).message}`);
     }
-    const pids = await Promise.all(apps.map(async ([name]) => {
-      try {
-        const [pid] = await conn.call({
-          destination: "org.freedesktop.DBus", path: "/org/freedesktop/DBus", interface: "org.freedesktop.DBus",
-          member: "GetConnectionUnixProcessID", signature: "s", body: [String(name)], timeoutMs,
-        });
-        return Number(pid);
-      } catch {
-        return -1;
-      }
-    }));
-    const index = pids.indexOf(window.pid);
-    const app = apps[index];
+    const appPids = await Promise.all(apps.map(([name]) => pidOf(conn, String(name))));
+    const app = apps[appPids.indexOf(window.pid)];
     if (!app) {
       throw new DesktopError(
         "unavailable",
@@ -324,7 +336,7 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
     const [frames] = await call(conn, appTarget, ACCESSIBLE, "GetChildren") as [DBusValue[][]];
     const targets = frames.map(([b, p]) => ({ bus: String(b), path: String(p), at: window.at }));
     if (targets.length <= 1 || !window.title) return targets.length ? targets : [appTarget];
-    const names = await Promise.all(targets.map((t) => conn.getProperty(t.bus, t.path, ACCESSIBLE, "Name").then(String, () => "")));
+    const names = await Promise.all(targets.map((t) => property(conn, t, ACCESSIBLE, "Name").then(String, () => "")));
     const exact = targets.filter((_, i) => names[i] === window.title);
     if (exact.length) return exact;
     const title = window.title;
@@ -333,15 +345,6 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
       return !!name && (title.includes(name) || name.includes(title));
     });
     return partial.length ? partial : targets;
-  }
-
-  async function tree(window: AxWindow): Promise<Node[]> {
-    const conn = await bus();
-    return flatten(await walk(conn, await windowRoots(conn, window)));
-  }
-
-  function toElement(node: Node): AxElement {
-    return { ref: mint(node), ...node.element };
   }
 
   function matches(node: Node, query: AxQuery): boolean {
@@ -355,7 +358,6 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
       const hay = [element.name, element.text ?? "", element.value === undefined ? "" : String(element.value)];
       if (!hay.some((h) => h.toLowerCase().includes(needle))) return false;
     }
-    if (query.states?.length && !query.states.every((s) => element.states.includes(s.toLowerCase()))) return false;
     if (query.actionable) {
       const interactive = INTERACTIVE_ROLES.has(element.role)
         || element.states.includes("editable")
@@ -387,11 +389,12 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
 
   return {
     async query(window, query) {
-      const nodes = await tree(window);
+      const conn = await bus();
+      const nodes = flatten(await walk(conn, await windowRoots(conn, window)));
       const roles: Record<string, number> = {};
       for (const node of nodes) roles[node.element.role] = (roles[node.element.role] ?? 0) + 1;
       const matched = nodes.filter((node) => node.depth > 0 || nodes.length === 1).filter((node) => matches(node, query));
-      return { elements: matched.slice(0, query.limit).map(toElement), total: matched.length, roles };
+      return { elements: matched.slice(0, query.limit).map((node) => ({ ref: mint(node), ...node.element })), total: matched.length, roles };
     },
 
     perform: (ref, action) => withTarget(ref, "click its coordinates instead", async (conn, target) => {
@@ -415,7 +418,7 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
     }),
 
     setValue: (ref, value) => withTarget(ref, "use keys or drag it instead", async (conn, target) => {
-      await conn.setProperty(target.bus, target.path, VALUE, "CurrentValue", variant("d", value));
+      await call(conn, target, PROPERTIES, "Set", "ssv", [VALUE, "CurrentValue", variant("d", value)]);
     }),
 
     focus: (ref) => withTarget(ref, "click it instead", async (conn, target) => {
@@ -427,24 +430,6 @@ export function createAtspi(options: AtspiOptions = {}): Atspi {
       const { element } = await read(conn, target);
       return { ref, ...element };
     }),
-
-    async at(window, x, y) {
-      let best: Node | null = null;
-      for (const node of await tree(window)) {
-        if (!contains(node.element, x, y)) continue;
-        const area = (node.element.width ?? 0) * (node.element.height ?? 0);
-        const bestArea = best ? (best.element.width ?? 0) * (best.element.height ?? 0) : Infinity;
-        if (!best || area < bestArea || (area === bestArea && node.depth > best.depth)) best = node;
-      }
-      return best ? toElement(best) : null;
-    },
-
-    async focusedEditable(window) {
-      const node = (await tree(window)).find((n) =>
-        n.element.states.includes("focused")
-        && (n.element.states.includes("editable") || n.element.role === "password text"));
-      return node ? toElement(node) : null;
-    },
 
     async close() {
       const pending = connecting;

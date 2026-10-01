@@ -1,6 +1,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DesktopError } from "./errors.js";
+import { runtimeDir } from "./session.js";
 
 /** How long a holder keeps the desktop after its last input. */
 export const LEASE_IDLE_MS = 15_000;
@@ -38,8 +39,8 @@ export class DesktopLease {
   }
 
   /** Claim or renew for `caller`, or throw `busy` naming the holder. */
-  claim(caller: string): void {
-    this.locked(() => {
+  async claim(caller: string): Promise<void> {
+    await this.locked(() => {
       const held = this.peek();
       if (held && held.holder !== caller) {
         const waitS = Math.ceil((LEASE_IDLE_MS - held.idleMs) / 1000);
@@ -67,7 +68,7 @@ export class DesktopLease {
 
   // An exclusive-create file is the cross-process mutex; one left by a crashed
   // process is broken after MUTEX_STALE_MS, far longer than any claim takes.
-  private locked<T>(body: () => T): T {
+  private async locked<T>(body: () => T): Promise<T> {
     const deadline = this.now() + MUTEX_STALE_MS * 2;
     for (;;) {
       try {
@@ -79,7 +80,7 @@ export class DesktopLease {
           if (this.now() - statSync(this.mutex).mtimeMs > MUTEX_STALE_MS) rmSync(this.mutex, { force: true });
         } catch {}
         if (this.now() > deadline) throw new DesktopError("failed", "The desktop lease file stayed locked; try again.");
-        Bun.sleepSync(5);
+        await Bun.sleep(5);
       }
     }
     try {
@@ -90,8 +91,6 @@ export class DesktopLease {
   }
 }
 
-export function leaseDir(env: NodeJS.ProcessEnv = process.env): string {
-  const runtime = env.XDG_RUNTIME_DIR;
-  if (!runtime) throw new DesktopError("unavailable", "XDG_RUNTIME_DIR is unset; run inside the graphical session.");
-  return join(runtime, "ghost-desktop");
+export function leaseDir(env: NodeJS.ProcessEnv): string {
+  return join(runtimeDir(env), "ghost-desktop");
 }

@@ -18,15 +18,15 @@ afterEach(() => {
 
 const foot: HyprClient = {
   address: "0xa", class: "foot", title: "foot", pid: 7, at: [0, 0], size: [400, 300], workspace: { id: 1, name: "1" },
-  monitor: 0, floating: false, fullscreen: 0, hidden: false, mapped: true, focusHistoryID: 0, stable_id: "s1",
+  floating: false, fullscreen: 0, hidden: false, mapped: true, focusHistoryID: 0, stableId: "s1",
 };
 const files: HyprClient = { ...foot, address: "0xb", class: "org.gnome.Nautilus", title: "data", pid: 8, at: [0, 300], focusHistoryID: 1 };
 
 function element(ref: string, name: string, over: Partial<AxElement> = {}): AxElement {
-  return { ref, role: "button", name, states: ["sensitive", "showing"], actions: ["click"], x: 10, y: 310, width: 20, height: 20, ...over };
+  return { ref, role: "button", name, states: ["sensitive", "showing"], actions: ["click"], box: [10, 310, 20, 20], ...over };
 }
 
-function harness(options: { locked?: boolean | null; elements?: AxElement[]; shortcutFails?: boolean } = {}) {
+function harness(options: { locked?: boolean | null; elements?: AxElement[]; shortcutFails?: boolean; opens?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ghost-desktop-"));
   dirs.push(dir);
   const dispatched: Intent[] = [];
@@ -36,7 +36,7 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
   let active = "0xa";
   const hypr: Hypr = {
     clients: async () => [foot, files],
-    monitors: async () => [{ id: 0, name: "eDP-1", x: 0, y: 0, width: 1200, height: 800, scale: 1, focused: true, activeWorkspace: { id: 1, name: "1" } }],
+    monitors: async () => [{ name: "eDP-1", x: 0, y: 0, width: 1200, height: 800, scale: 1, focused: true, activeWorkspace: { id: 1, name: "1" } }],
     activeAddress: async () => active,
     layers: async () => [],
     cursor: async () => [0, 0],
@@ -46,31 +46,33 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
       dispatched.push(intent);
       if (intent.kind === "focus") active = intent.address;
     },
+    waitEvent: async (_names, { after }) => {
+      await after?.();
+      return options.opens ? { name: "openwindow", data: options.opens } : null;
+    },
   };
   const elements = options.elements ?? [element("e1", "Search"), element("e2", "Close")];
+  const known = (ref: string) => {
+    const found = elements.find((item) => item.ref === ref);
+    if (!found) throw new DesktopError("not_found", `Unknown ref ${ref}`);
+    return found;
+  };
   const atspi: Atspi = {
     query: async (_window, query) => {
       const found = elements.filter((item) => !query.text || item.name.toLowerCase().includes(query.text.toLowerCase()));
       return { elements: found.slice(0, query.limit), total: found.length, roles: { button: found.length } };
     },
-    perform: async (ref, action) => void performed.push(`${ref}:${action ?? ""}`),
-    setText: async (ref, text) => void performed.push(`${ref}=${text}`),
-    setValue: async (ref, value) => void performed.push(`${ref}=${value}`),
-    focus: async (ref) => void performed.push(`${ref}:focus`),
-    element: async (ref) => {
-      const found = elements.find((item) => item.ref === ref);
-      if (!found) throw new DesktopError("not_found", `Unknown ref ${ref}`);
-      return found;
-    },
-    at: async () => null,
-    focusedEditable: async () => null,
+    perform: async (ref, action) => void performed.push(`${known(ref).ref}:${action ?? ""}`),
+    setText: async (ref, text) => void performed.push(`${known(ref).ref}=${text}`),
+    setValue: async (ref, value) => void performed.push(`${known(ref).ref}=${value}`),
+    focus: async (ref) => void performed.push(`${known(ref).ref}:focus`),
+    element: async (ref) => known(ref),
     close: async () => {},
   };
   const pointer: VirtualPointer = {
     button: async (button, pressed) => void pointerCalls.push(`${button}:${pressed ? "down" : "up"}`),
     click: async (button, clicks) => void pointerCalls.push(`click ${button} x${clicks}`),
     scroll: async (dy, dx) => void pointerCalls.push(`scroll ${dy},${dx}`),
-    motion: async () => {},
     close: async () => {},
   };
   const run: Runner = async (argv) => {
@@ -79,7 +81,7 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
   };
   const capture = {} as Capture;
   const desktop = createDesktop({
-    hypr, capture, atspi: () => atspi, pointer: async () => pointer, lease: new DesktopLease(dir), run, env: {}, sleep: async () => {},
+    hypr, capture, atspi: () => atspi, pointer: async () => pointer, lease: new DesktopLease(dir), run, sleep: async () => {},
   });
   return { desktop, dispatched, commands, pointerCalls, performed, dir };
 }
@@ -139,6 +141,13 @@ describe("desktop_act", () => {
     const text = `${"ab".repeat(60)}XYZ`;
     await desktop.act({ steps: [{ do: "type", text }] }, "a");
     expect(commands.at(-1)).toEqual(["wtype", "--", text]);
+  });
+
+  it("launches through the window-open event and reports the new window", async () => {
+    const { desktop, dispatched } = harness({ opens: "b,1,org.gnome.Nautilus,data" });
+    const result = await desktop.act({ steps: [{ do: "launch", command: "nautilus", workspace: "2" }] }, "a");
+    expect(dispatched).toEqual([{ kind: "exec", command: "[workspace 2 silent] nautilus" }]);
+    expect(result.steps[0]!.window).toMatchObject({ address: "0xb", class: "org.gnome.Nautilus" });
   });
 
   it("drags with intermediate motion and always releases", async () => {

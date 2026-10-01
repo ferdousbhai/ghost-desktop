@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { ACT_VERBS, MAX_ELEMENTS, MAX_FRAMES, MAX_STEPS, type ActArgs, type Desktop, type LookArgs, type Observation } from "./desktop.js";
+import { ACT_VERBS, BOUNDS, MAX_STEPS, type ActArgs, type Desktop, type LookArgs, type Observation } from "./desktop.js";
 import { DesktopError } from "./errors.js";
 
 export const LOOK = "desktop_look";
@@ -9,7 +9,7 @@ export const ACT = "desktop_act";
 
 const str = (description: string) => ({ type: "string", description });
 const num = (description: string) => ({ type: "number", description });
-const int = (description: string, minimum: number, maximum: number) => ({ type: "integer", minimum, maximum, description });
+const int = (description: string, [minimum, maximum]: readonly [number, number, number]) => ({ type: "integer", minimum, maximum, description });
 const bool = (description: string) => ({ type: "boolean", description });
 
 const WINDOW = "A window: an address from desktop_look (0x…), a class such as firefox, or a title fragment; \"active\" or omitted is the focused one.";
@@ -32,14 +32,14 @@ export const TOOLS = [
         ui: bool("Read the window's controls (accessibility tree)."),
         find: str("With ui: only controls whose name, text, or value contains this."),
         role: str("With ui: only this role, such as button, text, menu item, check box."),
-        limit: int(`With ui: at most this many controls, default 40.`, 1, MAX_ELEMENTS),
+        limit: int(`With ui: at most this many controls, default ${BOUNDS.elements[2]}.`, BOUNDS.elements),
         image: bool("Take a screenshot."),
         region: str("Screenshot this screen rectangle, \"x,y WxH\"."),
         monitor: str("Screenshot this monitor by name."),
         scale: num("Image pixels per screen unit, 0.1-2; default 1."),
         lossless: bool("PNG instead of JPEG, for pixel-exact reading."),
-        frames: int("Shots to take, default 1.", 1, MAX_FRAMES),
-        interval_ms: int("Between frames, default 500.", 100, 5000),
+        frames: int("Shots to take, default 1.", BOUNDS.frames),
+        interval_ms: int(`Between frames, default ${BOUNDS.interval_ms[2]}.`, BOUNDS.interval_ms),
         clipboard: bool("Read the clipboard text."),
       },
       additionalProperties: false,
@@ -78,7 +78,7 @@ export const TOOLS = [
               to_x: num("drag: release x."),
               to_y: num("drag: release y."),
               button: { type: "string", enum: ["left", "right", "middle"] },
-              clicks: int("click: 2 is a double click.", 1, 3),
+              clicks: int("click: 2 is a double click.", BOUNDS.clicks),
               text: str("type, notify, copy: the text."),
               keys: str("key: the chord."),
               value: { type: ["string", "number"], description: "set: new text or number; omit to focus the control." },
@@ -89,7 +89,7 @@ export const TOOLS = [
               command: str("launch: the command line."),
               event: { type: "string", enum: ["open", "close", "title", "workspace"] },
               match: str("wait: the event's data contains this (class, title, workspace)."),
-              timeout_ms: int("wait, launch: how long, default 10000 / 8000.", 100, 60000),
+              timeout_ms: int(`wait, launch: how long, default ${BOUNDS.wait_ms[2]} / ${BOUNDS.launch_ms[2]}.`, BOUNDS.wait_ms),
               title: str("notify: the title."),
             },
             required: ["do"],
@@ -109,17 +109,23 @@ export const TOOLS = [
 function observationContent(observation: Observation, lead?: Record<string, unknown>): CallToolResult["content"] {
   return [
     { type: "text", text: JSON.stringify({ ...lead, ...observation.facts }) },
-    ...observation.images.map((shot) => ({ type: "image" as const, data: Buffer.from(shot.data).toString("base64"), mimeType: shot.mimeType })),
+    ...observation.images.map((shot) => ({ type: "image" as const, data: Buffer.from(shot.data.buffer, shot.data.byteOffset, shot.data.byteLength).toString("base64"), mimeType: shot.mimeType })),
   ];
 }
 
+/** The text leads with the code for a reader; `_meta` carries it, with details, for a program. */
 function errorResult(error: unknown, lead?: Record<string, unknown>): CallToolResult {
-  const message = error instanceof DesktopError ? `${error.code}: ${error.message}` : `failed: ${error instanceof Error ? error.message : String(error)}`;
-  return { content: [{ type: "text", text: lead ? `${JSON.stringify(lead)}\n${message}` : message }], isError: true };
+  const failure = error instanceof DesktopError ? error : new DesktopError("failed", error instanceof Error ? error.message : String(error));
+  const message = `${failure.code}: ${failure.message}`;
+  return {
+    content: [{ type: "text", text: lead ? `${JSON.stringify(lead)}\n${message}` : message }],
+    isError: true,
+    _meta: { code: failure.code, details: failure.details },
+  };
 }
 
 /** Runs one tool call; `caller` keys the desktop lease. */
-export async function callTool(desktop: Desktop, name: string, args: Record<string, unknown>, caller: string): Promise<CallToolResult> {
+async function callTool(desktop: Desktop, name: string, args: Record<string, unknown>, caller: string): Promise<CallToolResult> {
   try {
     if (name === LOOK) return { content: observationContent(await desktop.look(args as LookArgs, caller)) };
     if (name === ACT) {

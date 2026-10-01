@@ -1,6 +1,6 @@
 import { DesktopError } from "./errors.js";
 import { windowShown, type HyprClient, type HyprMonitor } from "./hypr.js";
-import { runCommand, type Runner } from "./run.js";
+import { runChecked, runCommand, type Runner } from "./run.js";
 
 export interface Shot {
   readonly data: Uint8Array;
@@ -41,17 +41,22 @@ export function imageSize(data: Uint8Array): [number, number] {
 }
 
 export function createCapture(run: Runner = runCommand) {
-  const grim = async (args: string[], options: CaptureOptions): Promise<{ data: Uint8Array; mimeType: Shot["mimeType"]; width: number; height: number }> => {
+  const grim = async (
+    args: string[],
+    options: CaptureOptions,
+    geometry: Shot["geometry"],
+    via: Shot["via"],
+    warnings: string[] = [],
+  ): Promise<Shot> => {
     const scale = options.scale ?? 1;
     if (!(scale >= 0.1 && scale <= 2)) throw new DesktopError("invalid", "scale must be between 0.1 and 2.");
     const format = options.lossless ? ["-t", "png"] : ["-t", "jpeg", "-q", "90"];
-    const result = await run(["grim", "-s", String(scale), ...format, ...args, "-"], { timeoutMs: 8000, binary: true });
-    if (result.code !== 0 || !result.bytes?.length) {
-      throw new DesktopError("failed", `grim failed: ${result.stderr.trim().slice(0, 200) || "no image"}`);
-    }
-    const [width, height] = imageSize(result.bytes);
-    return { data: result.bytes, mimeType: options.lossless ? "image/png" : "image/jpeg", width, height };
+    const { bytes } = await runChecked(run, ["grim", "-s", String(scale), ...format, ...args, "-"], { timeoutMs: 8000, binary: true });
+    if (!bytes?.length) throw new DesktopError("failed", "grim returned no image.");
+    const [width, height] = imageSize(bytes);
+    return { data: bytes, mimeType: options.lossless ? "image/png" : "image/jpeg", geometry, scale, width, height, via, warnings };
   };
+  const rect = ([x, y, w, h]: Shot["geometry"]) => `${x},${y} ${w}x${h}`;
 
   return {
     /**
@@ -63,13 +68,11 @@ export function createCapture(run: Runner = runCommand) {
      */
     async window(client: HyprClient, monitors: readonly HyprMonitor[], options: CaptureOptions = {}): Promise<Shot> {
       const geometry = [client.at[0], client.at[1], client.size[0], client.size[1]] as const;
-      const scale = options.scale ?? 1;
       let bufferError = "this window has no foreign-toplevel identifier";
       const identifier = client.stableId ?? client.stable_id;
       if (identifier) {
         try {
-          const image = await grim(["-T", identifier], options);
-          return { ...image, geometry, scale, via: "window-buffer", warnings: [] };
+          return await grim(["-T", identifier], options, geometry, "window-buffer");
         } catch (error) {
           bufferError = error instanceof Error ? error.message : String(error);
         }
@@ -81,27 +84,19 @@ export function createCapture(run: Runner = runCommand) {
           + "Bring it forward with desktop_act focus, then look again.",
         );
       }
-      const image = await grim(["-g", `${geometry[0]},${geometry[1]} ${geometry[2]}x${geometry[3]}`], options);
-      return {
-        ...image,
-        geometry,
-        scale,
-        via: "screen-region",
-        warnings: [`read from the screen (${bufferError}); a window covering it would show instead`],
-      };
+      return grim(["-g", rect(geometry)], options, geometry, "screen-region", [
+        `read from the screen (${bufferError}); a window covering it would show instead`,
+      ]);
     },
 
-    async monitor(monitor: HyprMonitor, options: CaptureOptions = {}): Promise<Shot> {
-      const image = await grim(["-o", monitor.name], options);
+    monitor(monitor: HyprMonitor, options: CaptureOptions = {}): Promise<Shot> {
       const geometry = [monitor.x, monitor.y, Math.round(monitor.width / monitor.scale), Math.round(monitor.height / monitor.scale)] as const;
-      return { ...image, geometry, scale: options.scale ?? 1, via: "monitor", warnings: [] };
+      return grim(["-o", monitor.name], options, geometry, "monitor");
     },
 
-    async region(geometry: readonly [number, number, number, number], options: CaptureOptions = {}): Promise<Shot> {
-      const [x, y, w, h] = geometry;
-      if (!(w > 0 && h > 0)) throw new DesktopError("invalid", "A region needs a positive width and height.");
-      const image = await grim(["-g", `${x},${y} ${w}x${h}`], options);
-      return { ...image, geometry, scale: options.scale ?? 1, via: "screen-region", warnings: [] };
+    region(geometry: Shot["geometry"], options: CaptureOptions = {}): Promise<Shot> {
+      if (!(geometry[2] > 0 && geometry[3] > 0)) throw new DesktopError("invalid", "A region needs a positive width and height.");
+      return grim(["-g", rect(geometry)], options, geometry, "screen-region");
     },
   };
 }

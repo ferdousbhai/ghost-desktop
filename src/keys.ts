@@ -1,6 +1,10 @@
 import { DesktopError } from "./errors.js";
 
-const MODIFIERS: Record<string, "SHIFT" | "CTRL" | "ALT" | "SUPER"> = {
+/** Hyprland's modifier names, with the name wtype gives each. */
+export const WTYPE_MODS = { SHIFT: "shift", CTRL: "ctrl", ALT: "alt", SUPER: "logo" } as const;
+export type Mod = keyof typeof WTYPE_MODS;
+
+const MODIFIERS: Record<string, Mod> = {
   shift: "SHIFT",
   ctrl: "CTRL",
   control: "CTRL",
@@ -24,7 +28,7 @@ const KEYSYMS: Record<string, string> = {
 
 export interface Chord {
   /** Hyprland modifier names, e.g. ["CTRL", "SHIFT"]. */
-  readonly mods: readonly ("SHIFT" | "CTRL" | "ALT" | "SUPER")[];
+  readonly mods: readonly Mod[];
   /** An XKB keysym name, e.g. "t", "Return", "F5". */
   readonly keysym: string;
 }
@@ -36,7 +40,7 @@ export function parseChord(chord: string): Chord {
   const parts = text.split(/\s*\+\s*/).filter((part) => part !== "");
   if (text.endsWith("+") && parts.at(-1) !== "+") parts.push("+");
   const base = parts.pop() ?? text;
-  const mods: Chord["mods"][number][] = [];
+  const mods: Mod[] = [];
   for (const part of parts) {
     const mod = MODIFIERS[part.toLowerCase()];
     if (!mod) throw new DesktopError("invalid", `Unknown modifier ${JSON.stringify(part)} in ${JSON.stringify(chord)}; use ctrl, shift, alt, or super.`);

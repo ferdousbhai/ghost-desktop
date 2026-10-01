@@ -1,16 +1,17 @@
 // Wire protocol ported from hypruse (MIT, Ilyas Khallouki).
 /**
  * A minimal Wayland client that owns one `zwlr_virtual_pointer_v1` device:
- * button, click, wheel, and relative motion as a regular client of the
- * compositor, so pointer input needs no root, no uinput, and no daemon.
+ * button, click, and wheel as a regular client of the compositor, so pointer
+ * input needs no root, no uinput, and no daemon.
  * Absolute positioning stays with Hyprland's cursor-move dispatch.
  *
  * Wire format, little-endian: u32 object id, u32 (size << 16 | opcode), args;
  * strings are u32 length (with NUL), bytes, NUL, padding to 4; fixed is 24.8.
  */
-import { connect, type Socket } from "node:net";
+import type { Socket } from "node:net";
 import { join } from "node:path";
 import { DesktopError } from "./errors.js";
+import { connectUnix, runtimeDir } from "./session.js";
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -18,7 +19,6 @@ export interface VirtualPointer {
   button(button: MouseButton, pressed: boolean): Promise<void>;
   click(button: MouseButton, clicks: number): Promise<void>;
   scroll(dy: number, dx: number): Promise<void>;
-  motion(dx: number, dy: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -31,7 +31,6 @@ const REGISTRY_GLOBAL = 0;
 const CALLBACK_DONE = 0;
 const MGR_CREATE_POINTER = 0;
 const MGR_DESTROY = 1;
-export const PTR_MOTION = 0;
 export const PTR_BUTTON = 2;
 export const PTR_AXIS = 3;
 export const PTR_FRAME = 4;
@@ -126,19 +125,16 @@ export function scrollMessages(dy: number, dx: number, discreteOk: boolean, time
   return messages;
 }
 
-export function socketPath(env: NodeJS.ProcessEnv = process.env): string {
+function socketPath(env: NodeJS.ProcessEnv): string {
   const display = env.WAYLAND_DISPLAY || "wayland-0";
-  if (display.startsWith("/")) return display;
-  if (!env.XDG_RUNTIME_DIR) {
-    throw new DesktopError("unavailable", "XDG_RUNTIME_DIR is unset, so there is no Wayland session to drive.");
-  }
-  return join(env.XDG_RUNTIME_DIR, display);
+  return display.startsWith("/") ? display : join(runtimeDir(env), display);
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 class Connection {
-  private buffer = Buffer.alloc(0);
+  // Unparsed bytes live in buffer[head, tail); a chunk is appended, never re-copied with the tail.
+  private buffer = Buffer.alloc(4096);
+  private head = 0;
+  private tail = 0;
   private nextId = 2;
   private failure: DesktopError | undefined;
   private readonly waiters = new Set<() => void>();
@@ -147,9 +143,10 @@ class Connection {
 
   constructor(private readonly socket: Socket) {
     socket.on("data", (chunk: Buffer) => {
-      const { events, rest } = parseEvents(Buffer.concat([this.buffer, chunk]));
-      this.buffer = Buffer.from(rest);
+      this.append(chunk);
+      const { events, rest } = parseEvents(this.buffer.subarray(this.head, this.tail));
       for (const event of events) this.handle(event);
+      this.head = this.tail - rest.length;
       this.wake();
     });
     socket.on("close", () => {
@@ -163,6 +160,19 @@ class Connection {
   }
 
   private readonly doneCallbacks = new Set<number>();
+
+  private append(chunk: Buffer): void {
+    const pending = this.tail - this.head;
+    if (this.tail + chunk.length > this.buffer.length) {
+      const next = pending + chunk.length > this.buffer.length ? Buffer.alloc(Math.max(this.buffer.length * 2, pending + chunk.length)) : this.buffer;
+      this.buffer.copy(next, 0, this.head, this.tail);
+      this.buffer = next;
+      this.head = 0;
+      this.tail = pending;
+    }
+    chunk.copy(this.buffer, this.tail);
+    this.tail += chunk.length;
+  }
 
   private handle({ objectId, opcode, body }: WireEvent): void {
     if (objectId === DISPLAY_ID && opcode === EV_ERROR) {
@@ -221,14 +231,7 @@ class Connection {
 
 /** Connect to the session's compositor and create one virtual pointer device. */
 export async function openVirtualPointer(env: NodeJS.ProcessEnv = process.env): Promise<VirtualPointer> {
-  const path = socketPath(env);
-  const socket = await new Promise<Socket>((resolve, reject) => {
-    const candidate = connect(path);
-    candidate.once("connect", () => resolve(candidate));
-    candidate.once("error", (error) =>
-      reject(new DesktopError("unavailable", `Cannot connect to the Wayland display at ${path}: ${error.message}.`)));
-  });
-  const wire = new Connection(socket);
+  const wire = new Connection(await connectUnix(socketPath(env), "The Wayland display"));
   try {
     wire.registry = wire.newId();
     wire.send(DISPLAY_ID, REQ_GET_REGISTRY, u32s(wire.registry));
@@ -264,25 +267,15 @@ function pointerFor(wire: Connection, managerId: number, pointerId: number, vers
   return {
     button,
     async click(name, clicks) {
-      const count = Math.max(1, Math.min(3, Math.trunc(clicks)));
-      for (let index = 0; index < count; index += 1) {
-        if (index) await sleep(60);
+      for (let index = 0; index < clicks; index += 1) {
+        if (index) await Bun.sleep(60);
         await button(name, true);
-        await sleep(20);
+        await Bun.sleep(20);
         await button(name, false);
       }
     },
     async scroll(dy, dx) {
       for (const [opcode, body] of scrollMessages(dy, dx, version >= 2)) wire.send(pointerId, opcode, body);
-      await wire.roundtrip();
-    },
-    async motion(dx, dy) {
-      const body = Buffer.alloc(12);
-      body.writeUInt32LE(nowMs(), 0);
-      body.writeInt32LE(toFixed(dx), 4);
-      body.writeInt32LE(toFixed(dy), 8);
-      wire.send(pointerId, PTR_MOTION, body);
-      wire.send(pointerId, PTR_FRAME);
       await wire.roundtrip();
     },
     async close() {

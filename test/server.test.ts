@@ -38,6 +38,7 @@ describe("ghost-desktop MCP server", () => {
     expect(act.isError).toBe(true);
     expect((act.content as Array<{ text: string }>)[0]!.text).toContain('"failedStep":1');
     expect((act.content as Array<{ text: string }>)[0]!.text).toContain("busy: Another agent");
+    expect(act._meta).toMatchObject({ code: "busy" });
     expect(callers[0]).toMatch(/^claude-code [0-9a-f]{8}$/);
     expect(callers[1]).toBe("ghost dous/conv-1");
   });

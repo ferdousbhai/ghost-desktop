@@ -14,7 +14,7 @@ function png(width: number, height: number): Uint8Array {
 
 const client: HyprClient = {
   address: "0xa", class: "foot", title: "t", pid: 1, at: [10, 20], size: [300, 200], workspace: { id: 2, name: "2" },
-  monitor: 0, floating: false, fullscreen: 0, hidden: false, mapped: true, focusHistoryID: 0, stableId: "abc",
+  floating: false, fullscreen: 0, hidden: false, mapped: true, focusHistoryID: 0, stableId: "abc",
 };
 const showing = [{ activeWorkspace: { id: 2, name: "2" } }] as HyprMonitor[];
 const elsewhere = [{ activeWorkspace: { id: 1, name: "1" } }] as HyprMonitor[];

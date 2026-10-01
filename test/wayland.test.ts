@@ -14,7 +14,6 @@ import {
   PTR_AXIS_SOURCE,
   PTR_BUTTON,
   PTR_FRAME,
-  PTR_MOTION,
   scrollMessages,
   toFixed,
   wlString,
@@ -70,6 +69,8 @@ class FakeCompositor {
   manager = 0;
   /** Send wl_display.error in reply to this pointer opcode. */
   failOn: number | undefined;
+  /** Write every reply a few bytes at a time, so events straddle chunks. */
+  trickle = false;
 
   constructor(private readonly globals: Array<[string, number]> = [["wl_seat", 7], [MANAGER_INTERFACE, 2]]) {
     this.server = createServer((socket) => {
@@ -87,7 +88,10 @@ class FakeCompositor {
     return new Promise((resolve) => this.server.listen(this.path, resolve));
   }
 
-  private handle(socket: Socket, event: Recorded): void {
+  private handle(raw: Socket, event: Recorded): void {
+    const socket = this.trickle
+      ? { write: (bytes: Buffer) => { for (let at = 0; at < bytes.length; at += 3) raw.write(bytes.subarray(at, at + 3)); } }
+      : raw;
     this.requests.push(event);
     const { objectId, opcode, body } = event;
     if (objectId === 1 && opcode === 1) {
@@ -139,27 +143,32 @@ describe("openVirtualPointer against a fake compositor", () => {
     return fake;
   }
 
-  it("binds the manager, creates a pointer, and sends button, wheel, and motion frames", async () => {
+  it("binds the manager, creates a pointer, and sends button and wheel frames", async () => {
     const compositor = await start();
     const pointer = await openVirtualPointer({ WAYLAND_DISPLAY: compositor.path });
     await pointer.click("right", 2);
     await pointer.scroll(1, 0);
-    await pointer.motion(3, -4);
     await pointer.close();
     expect(compositor.pointerOps()).toEqual([
       PTR_BUTTON, PTR_FRAME, PTR_BUTTON, PTR_FRAME, PTR_BUTTON, PTR_FRAME, PTR_BUTTON, PTR_FRAME,
       PTR_AXIS_SOURCE, PTR_AXIS_DISCRETE, PTR_FRAME,
-      PTR_MOTION, PTR_FRAME,
       8,
     ]);
     const buttons = compositor.requests.filter((request) => request.objectId === compositor.pointer && request.opcode === PTR_BUTTON);
     expect(buttons.map((request) => [request.body.readUInt32LE(4), request.body.readUInt32LE(8)])).toEqual([
       [0x111, 1], [0x111, 0], [0x111, 1], [0x111, 0],
     ]);
-    const motion = compositor.requests.find((request) => request.opcode === PTR_MOTION && request.objectId === compositor.pointer)!;
-    expect([motion.body.readInt32LE(4), motion.body.readInt32LE(8)]).toEqual([768, -1024]);
     // The manager is destroyed after the pointer.
     expect(compositor.requests.at(-2)).toMatchObject({ objectId: compositor.manager, opcode: 1 });
+  });
+
+  it("reassembles events that arrive split across chunks", async () => {
+    const compositor = await start([["wl_seat", 7], ["x".repeat(5000), 1], [MANAGER_INTERFACE, 2]]);
+    compositor.trickle = true;
+    const pointer = await openVirtualPointer({ WAYLAND_DISPLAY: compositor.path });
+    await pointer.click("left", 1);
+    await pointer.close();
+    expect(compositor.pointerOps()).toEqual([PTR_BUTTON, PTR_FRAME, PTR_BUTTON, PTR_FRAME, 8]);
   });
 
   it("stays on the continuous axis when only version 1 is offered", async () => {

@@ -1,7 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import net from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DBusConnection,
@@ -11,44 +7,40 @@ import {
   marshal,
   MessageType,
   socketPathOf,
-  splitSignature,
-  unmarshal,
   variant,
-  type DBusMessage,
   type DBusValue,
 } from "../src/dbus.js";
 import { DesktopError } from "../src/errors.js";
+import { fakeBus, type FakeBus } from "./helpers/fake-bus.js";
+
+/** Marshal as a message body and decode it back, the only path production reads by. */
+function roundTrip(signature: string, values: DBusValue[]): readonly DBusValue[] | undefined {
+  const frame = encodeMessage({ type: MessageType.MethodReturn, serial: 1, replySerial: 1, signature, body: values });
+  return decodeMessages(frame).messages[0]?.body;
+}
 
 describe("signatures", () => {
-  it("splits into complete types", () => {
-    expect(splitSignature("sa{sv}(ii)aa(so)v")).toEqual(["s", "a{sv}", "(ii)", "aa(so)", "v"]);
-  });
-
   it("refuses unbalanced and unknown types", () => {
-    expect(() => splitSignature("(ii")).toThrow(/unbalanced|ends early/);
-    expect(() => splitSignature("z")).toThrow(/unsupported/);
+    expect(() => marshal("(ii", [[1, 2]])).toThrow(/unbalanced|ends early/);
+    expect(() => marshal("z", [1])).toThrow(/unsupported/);
   });
 });
 
 describe("marshalling", () => {
-  const roundTrip = (signature: string, values: DBusValue[]) => unmarshal(signature, marshal(signature, values));
-
   it("round-trips every basic type", () => {
     const values: DBusValue[] = [7, true, -3, 65000, -70000, 4000000000, -5n, 2n ** 63n, 1.5, "héllo", "/a/b", "a(so)"];
     expect(roundTrip("ybnqiuxtdsog", values)).toEqual(values);
   });
 
   it("aligns after odd-sized fields", () => {
-    const bytes = marshal("yt", [1, 9n]);
-    expect(bytes.length).toBe(16);
-    expect(unmarshal("yt", bytes)).toEqual([1, 9n]);
+    expect(marshal("yt", [1, 9n]).length).toBe(16);
+    expect(roundTrip("yt", [1, 9n])).toEqual([1, 9n]);
   });
 
   it("pads an empty array to its element alignment", () => {
     // u32 length 0 at 4, then padding to 8 for the struct elements.
-    const bytes = marshal("ya(ii)y", [1, [], 2]);
-    expect(bytes.length).toBe(9);
-    expect(unmarshal("ya(ii)y", bytes)).toEqual([1, [], 2]);
+    expect(marshal("ya(ii)y", [1, [], 2]).length).toBe(9);
+    expect(roundTrip("ya(ii)y", [1, [], 2])).toEqual([1, [], 2]);
   });
 
   it("round-trips structs, dicts, nested arrays, and variants", () => {
@@ -60,16 +52,6 @@ describe("marshalling", () => {
       [10, 20, 30, 40],
     ];
     expect(roundTrip("a{si}a(so)aaiv(iiii)", values)).toEqual(values);
-  });
-
-  it("respects a base offset", () => {
-    const bytes = marshal("t", [1n], 4);
-    expect(bytes.length).toBe(12);
-  });
-
-  it("reads big-endian data", () => {
-    const be = new Uint8Array([0, 0, 0, 5, 0, 0, 0, 1, 0x61, 0]);
-    expect(unmarshal("us", be, false)).toEqual([5, "a"]);
   });
 });
 
@@ -97,79 +79,45 @@ describe("addresses", () => {
   });
 });
 
-type Handler = (message: DBusMessage) => { signature?: string; body?: DBusValue[] } | { error: string; text: string } | null;
-
-let cleanup: Array<() => void> = [];
+let buses: FakeBus[] = [];
+let conns: DBusConnection[] = [];
 afterEach(() => {
-  for (const fn of cleanup) fn();
-  cleanup = [];
+  for (const conn of conns) conn.close();
+  for (const bus of buses) bus.close();
+  buses = [];
+  conns = [];
 });
 
-async function fakeBus(handler: Handler): Promise<string> {
-  const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "dbus-"));
-  const path = join(dir, "bus");
-  let serial = 1000;
-  const server = net.createServer((socket) => {
-    let authed = false;
-    let buffer: Uint8Array = new Uint8Array(0);
-    socket.on("data", (chunk: Buffer) => {
-      if (!authed) {
-        const text = chunk.toString("latin1");
-        if (text.includes("AUTH")) socket.write("OK 0123456789abcdef\r\n");
-        if (!text.includes("BEGIN")) return;
-        authed = true;
-        chunk = Buffer.from(text.slice(text.indexOf("BEGIN\r\n") + 7), "latin1");
-      }
-      const joined = new Uint8Array(buffer.length + chunk.length);
-      joined.set(buffer);
-      joined.set(chunk, buffer.length);
-      const { messages, rest } = decodeMessages(joined);
-      buffer = rest;
-      for (const message of messages) {
-        const answer = message.member === "Hello" ? { signature: "s", body: [":1.42"] } : handler(message);
-        if (answer === null) continue;
-        if ("error" in answer) {
-          socket.write(encodeMessage({ type: MessageType.Error, serial: ++serial, replySerial: message.serial, errorName: answer.error, signature: "s", body: [answer.text] }));
-        } else {
-          socket.write(encodeMessage({ type: MessageType.MethodReturn, serial: ++serial, replySerial: message.serial, ...(answer.signature ? { signature: answer.signature, body: answer.body ?? [] } : {}) }));
-        }
-      }
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(path, resolve));
-  cleanup.push(() => {
-    server.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-  return `unix:path=${path}`;
+async function connect(handler: Parameters<typeof fakeBus>[0]): Promise<DBusConnection> {
+  const bus = await fakeBus(handler);
+  buses.push(bus);
+  const conn = await DBusConnection.connect(bus.address);
+  conns.push(conn);
+  return conn;
 }
 
 describe("DBusConnection", () => {
   it("authenticates, says Hello, and matches replies to calls", async () => {
-    const address = await fakeBus((m) => ({ signature: "s", body: [`${m.member}:${m.body?.[0]}`] }));
-    const conn = await DBusConnection.connect(address);
-    cleanup.push(() => conn.close());
-    expect(conn.uniqueName).toBe(":1.42");
+    const conn = await connect((m) => ({ signature: "s", body: [`${m.member}:${m.body?.[0]}`] }));
     const results = await Promise.all(["a", "b", "c"].map((x) =>
       conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Echo", signature: "s", body: [x] })));
     expect(results).toEqual([["Echo:a"], ["Echo:b"], ["Echo:c"]]);
   });
 
-  it("turns error replies into DBusError and unwraps properties", async () => {
-    const address = await fakeBus((m) => {
-      if (m.member === "Get") return { signature: "v", body: [variant("s", `prop ${m.body?.[1]}`)] };
-      return { error: "org.freedesktop.DBus.Error.UnknownMethod", text: "no such method" };
-    });
-    const conn = await DBusConnection.connect(address);
-    cleanup.push(() => conn.close());
-    expect(await conn.getProperty("d", "/p", "i.I", "Name")).toBe("prop Name");
+  it("reassembles a reply that arrives in many chunks", async () => {
+    const big = "x".repeat(200_000);
+    const conn = await connect(() => ({ signature: "s", body: [big] }));
+    expect(await conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Big" })).toEqual([big]);
+  });
+
+  it("turns error replies into DBusError", async () => {
+    const conn = await connect(() => ({ error: "org.freedesktop.DBus.Error.UnknownMethod", text: "no such method" }));
     await expect(conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Nope" }))
       .rejects.toMatchObject({ name: "DBusError", dbusName: "org.freedesktop.DBus.Error.UnknownMethod", message: "no such method" });
   });
 
   it("times out a call that gets no reply, and fails pending calls on close", async () => {
-    const address = await fakeBus(() => null);
-    const conn = await DBusConnection.connect(address);
+    const conn = await connect(() => null);
     await expect(conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Slow", timeoutMs: 50 }))
       .rejects.toThrow(/no reply within 50ms/);
     const pending = conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Slow", timeoutMs: 5000 });

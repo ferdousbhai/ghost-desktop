@@ -1,20 +1,27 @@
-import { connect } from "node:net";
-import { join } from "node:path";
-import type { Atspi, AxElement, AxWindow } from "./atspi.js";
+import { centerOf, type Atspi, type AxElement } from "./atspi.js";
 import { parseRegion, type Capture, type Shot } from "./capture.js";
 import { DesktopError } from "./errors.js";
-import { resolveWindow, windowShown, type Hypr, type HyprClient } from "./hypr.js";
-import { parseChord } from "./keys.js";
+import { resolveWindow, type Hypr, type HyprClient, type HyprMonitor } from "./hypr.js";
+import { parseChord, WTYPE_MODS } from "./keys.js";
 import type { DesktopLease } from "./lease.js";
 import { runChecked, type Runner } from "./run.js";
 import type { MouseButton, VirtualPointer } from "./wayland.js";
 
-export const MAX_WINDOWS = 60;
-export const MAX_TEXT = 160;
-export const MAX_ELEMENTS = 200;
-export const DEFAULT_ELEMENTS = 40;
-export const MAX_FRAMES = 12;
+/** Bounds the schema advertises and the steps enforce: [min, max, default]. */
+export const BOUNDS = {
+  elements: [1, 200, 40],
+  frames: [1, 12, 1],
+  interval_ms: [100, 5000, 500],
+  clicks: [1, 3, 1],
+  wait_ms: [100, 60_000, 10_000],
+  launch_ms: [100, 60_000, 8000],
+} as const;
 export const MAX_STEPS = 30;
+const MAX_WINDOWS = 60;
+const MAX_TEXT = 160;
+
+const clampInt = (value: number | undefined, [min, max, fallback]: readonly [number, number, number]) =>
+  Math.min(Math.max(min, Math.trunc(value ?? fallback)), max);
 
 export interface LookArgs {
   window?: string;
@@ -90,9 +97,10 @@ export interface DesktopDeps {
   readonly pointer: () => Promise<VirtualPointer>;
   readonly lease: DesktopLease;
   readonly run: Runner;
-  readonly env: NodeJS.ProcessEnv;
   readonly sleep?: (ms: number) => Promise<void>;
 }
+
+const EVENTS = { open: ["openwindow"], close: ["closewindow"], title: ["windowtitlev2", "windowtitle"], workspace: ["workspacev2", "workspace"] } as const;
 
 const clip = (text: string | undefined, max = MAX_TEXT) => (text && text.length > max ? `${text.slice(0, max - 1)}…` : text ?? "");
 
@@ -112,14 +120,12 @@ function windowFacts(client: HyprClient, active: string | null): Record<string, 
 }
 
 function elementFacts(element: AxElement): Record<string, unknown> {
-  const box = element.x !== undefined && element.width !== undefined && element.y !== undefined && element.height !== undefined
-    ? { at: [element.x + Math.round(element.width / 2), element.y + Math.round(element.height / 2)], size: [element.width, element.height] }
-    : {};
+  const at = centerOf(element);
   return {
     ref: element.ref,
     role: element.role,
     ...(element.name ? { name: clip(element.name) } : {}),
-    ...box,
+    ...(at && element.box ? { at, size: [element.box[2], element.box[3]] } : {}),
     ...(element.value !== undefined ? { value: element.value } : {}),
     ...(element.text ? { text: clip(element.text, 400) } : {}),
     ...(element.checked !== undefined ? { checked: element.checked } : {}),
@@ -131,7 +137,7 @@ function elementFacts(element: AxElement): Record<string, unknown> {
 
 export function createDesktop(deps: DesktopDeps) {
   const { hypr, capture, lease, run } = deps;
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const sleep = deps.sleep ?? Bun.sleep;
   let atspi: Atspi | undefined;
   const ax = () => (atspi ??= deps.atspi());
   // A pointer device per step, closed after it: nothing lingers in the
@@ -145,12 +151,18 @@ export function createDesktop(deps: DesktopDeps) {
     }
   };
 
-  const axWindow = (client: HyprClient): AxWindow => ({ pid: client.pid, at: client.at, address: client.address, title: client.title });
-
   const window = async (query?: string) => {
     const [clients, active] = await Promise.all([hypr.clients(), hypr.activeAddress()]);
-    return resolveWindow(clients, active, query);
+    return { client: resolveWindow(clients, active, query), active };
   };
+
+  /** Focus a window unless it already has focus; a pointer or a keystroke lands on whatever does. */
+  async function focus(client: HyprClient, active: string | null, disturbed: string[]): Promise<void> {
+    if (client.address === active) return;
+    await hypr.dispatch({ kind: "focus", address: client.address });
+    disturbed.push("focus");
+    await sleep(60);
+  }
 
   async function desktopFacts(caller: string): Promise<Record<string, unknown>> {
     const [clients, active, monitors, layers, cursor] = await Promise.all([
@@ -178,10 +190,9 @@ export function createDesktop(deps: DesktopDeps) {
     };
   }
 
-  async function shot(args: LookArgs, client: HyprClient | undefined): Promise<Shot> {
+  function shot(args: LookArgs, client: HyprClient | undefined, monitors: readonly HyprMonitor[]): Promise<Shot> {
     const options = { ...(args.lossless ? { lossless: true } : {}), ...(args.scale !== undefined ? { scale: args.scale } : {}) };
     if (args.region) return capture.region(parseRegion(args.region), options);
-    const monitors = await hypr.monitors();
     if (client) return capture.window(client, monitors, options);
     const monitor = args.monitor
       ? monitors.find((candidate) => candidate.name === args.monitor)
@@ -193,14 +204,13 @@ export function createDesktop(deps: DesktopDeps) {
   async function look(args: LookArgs, caller: string): Promise<Observation> {
     const facts: Record<string, unknown> = {};
     const images: Shot[] = [];
-    const wantsWindow = args.window !== undefined || args.ui === true;
-    const client = wantsWindow ? await window(args.window) : undefined;
-    if (!wantsWindow && !args.image && !args.clipboard) Object.assign(facts, await desktopFacts(caller));
-    if (client) facts.window = windowFacts(client, await hypr.activeAddress());
+    const target = args.window !== undefined || args.ui === true ? await window(args.window) : undefined;
+    const client = target?.client;
+    if (target) facts.window = windowFacts(target.client, target.active);
+    else if (!args.image && !args.clipboard) Object.assign(facts, await desktopFacts(caller));
     if (client && args.ui) {
-      const limit = Math.min(Math.max(1, Math.trunc(args.limit ?? DEFAULT_ELEMENTS)), MAX_ELEMENTS);
-      const result = await ax().query(axWindow(client), {
-        limit,
+      const result = await ax().query(client, {
+        limit: clampInt(args.limit, BOUNDS.elements),
         actionable: !args.find && !args.role,
         ...(args.find ? { text: args.find } : {}),
         ...(args.role ? { role: args.role } : {}),
@@ -210,11 +220,12 @@ export function createDesktop(deps: DesktopDeps) {
       if (result.elements.length === 0 && args.role && !result.roles[args.role]) facts.rolesPresent = result.roles;
     }
     if (args.image || args.region || args.monitor) {
-      const frames = Math.min(Math.max(1, Math.trunc(args.frames ?? 1)), MAX_FRAMES);
-      const interval = Math.min(Math.max(100, Math.trunc(args.interval_ms ?? 500)), 5000);
+      const frames = clampInt(args.frames, BOUNDS.frames);
+      const interval = clampInt(args.interval_ms, BOUNDS.interval_ms);
+      const monitors = args.region ? [] : await hypr.monitors();
       for (let index = 0; index < frames; index += 1) {
         if (index) await sleep(interval);
-        images.push(await shot(args, client));
+        images.push(await shot(args, client, monitors));
       }
       const [first] = images;
       if (!first) throw new DesktopError("failed", "No screenshot was taken.");
@@ -234,16 +245,16 @@ export function createDesktop(deps: DesktopDeps) {
     return { facts, images };
   }
 
-  async function elementFor(step: ActStep): Promise<{ element: AxElement; client: HyprClient | undefined }> {
-    if (step.ref) return { element: await ax().element(step.ref), client: step.window ? await window(step.window) : undefined };
+  /** The one control a step's name picks in its window; an ambiguous name lists refs instead. */
+  async function named(step: ActStep): Promise<{ element: AxElement; client: HyprClient; active: string | null }> {
     if (!step.name) throw new DesktopError("invalid", `${step.do} needs ref or name (a control from look with ui), or x and y.`);
-    const client = await window(step.window);
-    const { elements } = await ax().query(axWindow(client), { text: step.name, limit: 20 });
+    const { client, active } = await window(step.window);
+    const { elements } = await ax().query(client, { text: step.name, limit: 20 });
     const folded = step.name.toLowerCase();
     const exact = elements.filter((element) => element.name.toLowerCase() === folded);
     const candidates = exact.length ? exact : elements;
     const [only] = candidates;
-    if (only && candidates.length === 1) return { element: only, client };
+    if (only && candidates.length === 1) return { element: only, client, active };
     if (candidates.length === 0) throw new DesktopError("not_found", `No control named ${JSON.stringify(step.name)} in ${client.class}; look with ui to see what it offers, or use an image.`);
     throw new DesktopError(
       "invalid",
@@ -252,111 +263,61 @@ export function createDesktop(deps: DesktopDeps) {
     );
   }
 
-  const center = (element: AxElement): [number, number] => {
-    if (element.x === undefined || element.y === undefined || element.width === undefined || element.height === undefined) {
-      throw new DesktopError("unavailable", `${element.ref} reports no position; use perform, or click by x and y from an image.`);
-    }
-    return [element.x + element.width / 2, element.y + element.height / 2];
-  };
+  const refOf = async (step: ActStep) => step.ref ?? (await named(step)).element.ref;
 
-  async function pointAt(step: ActStep): Promise<{ point: [number, number]; disturbed: string[] }> {
-    if (step.x !== undefined && step.y !== undefined) return { point: [step.x, step.y], disturbed: [] };
-    const { element, client } = await elementFor(step);
-    const disturbed: string[] = [];
-    // A pointer click lands on whatever is on top, so the window has to be.
-    const { x, y } = element;
-    const target = client ?? (x === undefined || y === undefined ? undefined : (await hypr.clients()).find((candidate) =>
-      x >= candidate.at[0] && x < candidate.at[0] + candidate.size[0]
-      && y >= candidate.at[1] && y < candidate.at[1] + candidate.size[1]));
-    if (target && target.address !== await hypr.activeAddress()) {
-      await hypr.dispatch({ kind: "focus", address: target.address });
-      disturbed.push("focus");
-      await sleep(60);
-    }
-    return { point: center(element), disturbed };
+  /** The screen point a click aims at, with the window under it brought forward. */
+  async function pointAt(step: ActStep, disturbed: string[]): Promise<[number, number]> {
+    if (step.x !== undefined && step.y !== undefined) return [step.x, step.y];
+    const found = step.ref
+      ? await Promise.all([ax().element(step.ref), hypr.clients(), hypr.activeAddress()])
+        .then(([element, clients, active]) => ({ element, active, client: step.window ? resolveWindow(clients, active, step.window) : undefined, clients }))
+      : { ...(await named(step)), clients: undefined };
+    const point = centerOf(found.element);
+    if (!point) throw new DesktopError("unavailable", `${found.element.ref} reports no position; use perform, or click by x and y from an image.`);
+    const [x, y] = point;
+    const client = found.client ?? found.clients?.find((candidate) =>
+      x >= candidate.at[0] && x < candidate.at[0] + candidate.size[0] && y >= candidate.at[1] && y < candidate.at[1] + candidate.size[1]);
+    if (client) await focus(client, found.active, disturbed);
+    return point;
   }
 
-  async function moveCursor(x: number, y: number): Promise<void> {
-    await hypr.dispatch({ kind: "cursor", x, y });
-  }
-
-  async function focusIfNeeded(query: string | undefined, disturbed: string[]): Promise<HyprClient | undefined> {
-    if (query === undefined) return undefined;
-    const client = await window(query);
-    if (client.address !== await hypr.activeAddress()) {
-      await hypr.dispatch({ kind: "focus", address: client.address });
-      disturbed.push("focus");
-      await sleep(60);
-    }
-    return client;
-  }
-
-  async function waitFor(event: NonNullable<ActStep["event"]>, match: string | undefined, timeoutMs: number): Promise<Record<string, unknown>> {
-    const signature = deps.env.HYPRLAND_INSTANCE_SIGNATURE;
-    const runtime = deps.env.XDG_RUNTIME_DIR;
-    if (!signature || !runtime) throw new DesktopError("unavailable", "wait needs a Hyprland session (HYPRLAND_INSTANCE_SIGNATURE).");
-    const wanted = { open: ["openwindow"], close: ["closewindow"], title: ["windowtitlev2", "windowtitle"], workspace: ["workspacev2", "workspace"] }[event];
-    const folded = match?.toLowerCase();
-    return new Promise((resolve, reject) => {
-      const socket = connect(join(runtime, "hypr", signature, ".socket2.sock"));
-      let buffer = "";
-      const finish = (value: Record<string, unknown> | Error) => {
-        clearTimeout(timer);
-        socket.destroy();
-        value instanceof Error ? reject(value) : resolve(value);
-      };
-      const timer = setTimeout(() => finish({ timedOut: true, event }), timeoutMs);
-      socket.on("error", (error) => finish(new DesktopError("unavailable", `Hyprland's event socket is unreachable: ${error.message}`)));
-      socket.on("data", (chunk) => {
-        buffer += chunk.toString("utf8");
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const [name, data = ""] = line.split(">>", 2);
-          if (!name || !wanted.includes(name)) continue;
-          if (folded && !data.toLowerCase().includes(folded)) continue;
-          finish({ event, data: clip(data) });
-          return;
-        }
-      });
-    });
-  }
+  const moveCursor = (x: number, y: number) => hypr.dispatch({ kind: "cursor", x, y });
 
   async function step(step: ActStep): Promise<StepReport> {
     const disturbed: string[] = [];
     const report = (did: string, extra: Partial<StepReport> = {}): StepReport => ({ do: step.do, did, disturbed, ...extra });
     switch (step.do) {
       case "click": {
-        const { point, disturbed: moved } = await pointAt(step);
-        disturbed.push(...moved, "pointer");
-        await moveCursor(point[0], point[1]);
+        const [x, y] = await pointAt(step, disturbed);
+        disturbed.push("pointer");
+        await moveCursor(x, y);
         await sleep(20);
-        const clicks = Math.min(Math.max(1, Math.trunc(step.clicks ?? 1)), 3);
+        const clicks = clampInt(step.clicks, BOUNDS.clicks);
         await withPointer((pointer) => pointer.click(step.button ?? "left", clicks));
-        return report(`clicked ${step.button ?? "left"}${clicks > 1 ? ` x${clicks}` : ""} at ${Math.round(point[0])},${Math.round(point[1])}`);
+        return report(`clicked ${step.button ?? "left"}${clicks > 1 ? ` x${clicks}` : ""} at ${Math.round(x)},${Math.round(y)}`);
       }
       case "perform": {
-        const { element } = await elementFor(step);
-        await ax().perform(element.ref, step.action);
-        return report(`${step.action ?? "default action"} on ${element.ref} ${element.role} "${clip(element.name, 40)}"`);
+        const ref = await refOf(step);
+        await ax().perform(ref, step.action);
+        return report(`${step.action ?? "default action"} on ${ref}`);
       }
       case "set": {
-        const { element } = await elementFor(step);
+        const ref = await refOf(step);
         if (step.value === undefined) {
-          await ax().focus(element.ref);
-          return report(`focused ${element.ref}`);
+          await ax().focus(ref);
+          return report(`focused ${ref}`);
         }
-        if (typeof step.value === "number") await ax().setValue(element.ref, step.value);
-        else await ax().setText(element.ref, step.value);
-        return report(`set ${element.ref} to ${JSON.stringify(clip(String(step.value), 40))}`);
+        if (typeof step.value === "number") await ax().setValue(ref, step.value);
+        else await ax().setText(ref, step.value);
+        return report(`set ${ref} to ${JSON.stringify(clip(String(step.value), 40))}`);
       }
       case "type": {
         if (step.text === undefined) throw new DesktopError("invalid", "type needs text.");
-        if (step.ref || step.name) {
-          const { element } = await elementFor(step);
-          await ax().focus(element.ref);
+        if (step.ref || step.name) await ax().focus(await refOf(step));
+        if (step.window !== undefined) {
+          const { client, active } = await window(step.window);
+          await focus(client, active, disturbed);
         }
-        await focusIfNeeded(step.window, disturbed);
         // As an argument: wtype reading stdin drops characters first seen past ~100 in.
         await runChecked(run, ["wtype", "--", step.text], { timeoutMs: 15_000 });
         return report(`typed ${step.text.length} characters into the focused field`);
@@ -364,16 +325,18 @@ export function createDesktop(deps: DesktopDeps) {
       case "key": {
         if (!step.keys) throw new DesktopError("invalid", "key needs keys, such as ctrl+s or Return.");
         const chord = parseChord(step.keys);
-        const client = await window(step.window);
+        const { client, active } = await window(step.window);
         try {
           // Delivered to the window itself: no focus change, works on a covered window.
           await hypr.dispatch({ kind: "shortcut", mods: chord.mods.join(" "), key: chord.keysym, address: client.address });
           return report(`sent ${step.keys} to ${client.class}`);
-        } catch {
-          await focusIfNeeded(client.address, disturbed);
-          const mods = chord.mods.map((mod) => ({ SHIFT: "shift", CTRL: "ctrl", ALT: "alt", SUPER: "logo" })[mod]);
+        } catch (error) {
+          // Hyprland names keys from the last keyboard's keymap; after a type that is wtype's.
+          if (!(error instanceof DesktopError && error.code === "failed")) throw error;
+          await focus(client, active, disturbed);
+          const mods = chord.mods.map((mod) => WTYPE_MODS[mod]);
           await runChecked(run, ["wtype", ...mods.flatMap((mod) => ["-M", mod]), "-k", chord.keysym, ...mods.flatMap((mod) => ["-m", mod])]);
-          return report(`pressed ${step.keys} in the focused ${client.class}`);
+          return report(`pressed ${step.keys} in the focused ${client.class}`, { warnings: [error.message] });
         }
       }
       case "drag": {
@@ -397,7 +360,7 @@ export function createDesktop(deps: DesktopDeps) {
             await pointer.button(button, false);
           }
         });
-        return report(`dragged from ${step.x},${step.y} to ${step.to_x},${step.to_y}`);
+        return report(`dragged from ${x},${y} to ${toX},${toY}`);
       }
       case "scroll": {
         if (!step.dy && !step.dx) throw new DesktopError("invalid", "scroll needs dy (positive scrolls down) or dx.");
@@ -416,7 +379,7 @@ export function createDesktop(deps: DesktopDeps) {
         return report(`pointer at ${step.x},${step.y}`);
       }
       case "focus": {
-        const client = await window(step.window);
+        const { client } = await window(step.window);
         await hypr.dispatch({ kind: "focus", address: client.address });
         disturbed.push("focus");
         return report(`focused ${client.class}`, { window: windowFacts(client, client.address) });
@@ -429,34 +392,36 @@ export function createDesktop(deps: DesktopDeps) {
       }
       case "send": {
         if (!step.workspace) throw new DesktopError("invalid", "send needs workspace.");
-        const client = await window(step.window);
+        const { client } = await window(step.window);
         await hypr.dispatch({ kind: "move", address: client.address, workspace: step.workspace });
         return report(`moved ${client.class} to workspace ${step.workspace}`);
       }
       case "close":
       case "fullscreen":
       case "float": {
-        const client = await window(step.window);
+        const { client } = await window(step.window);
         await hypr.dispatch({ kind: step.do, address: client.address });
         return report(`${step.do === "close" ? "closed" : `toggled ${step.do} on`} ${client.class}`);
       }
       case "launch": {
-        if (!step.command) throw new DesktopError("invalid", "launch needs command.");
-        const before = new Set((await hypr.clients()).map((client) => client.address));
+        const { command } = step;
+        if (!command) throw new DesktopError("invalid", "launch needs command.");
         const rule = step.workspace ? `[workspace ${step.workspace} silent] ` : "";
-        await hypr.dispatch({ kind: "exec", command: `${rule}${step.command}` });
-        const deadline = Date.now() + Math.min(step.timeout_ms ?? 8000, 30_000);
-        while (Date.now() < deadline) {
-          await sleep(150);
-          const opened = (await hypr.clients()).find((client) => !before.has(client.address) && client.mapped);
-          if (opened) return report(`launched ${step.command}`, { window: windowFacts(opened, await hypr.activeAddress()) });
-        }
-        return report(`launched ${step.command}; no new window appeared yet`, { warnings: ["no window within the timeout; it may still be starting, or it reused an existing window"] });
+        const opened = await hypr.waitEvent(EVENTS.open, {
+          timeoutMs: clampInt(step.timeout_ms, BOUNDS.launch_ms),
+          after: () => hypr.dispatch({ kind: "exec", command: `${rule}${command}` }),
+        });
+        if (!opened) return report(`launched ${command}; no window appeared`, { warnings: ["no window within the timeout; it may still be starting, or it reused an existing window"] });
+        const { client, active } = await window(`0x${opened.data.split(",", 1)[0]}`);
+        return report(`launched ${command}`, { window: windowFacts(client, active) });
       }
       case "wait": {
         const event = step.event ?? "open";
-        const result = await waitFor(event, step.match, Math.min(Math.max(100, step.timeout_ms ?? 10_000), 60_000));
-        return report(result.timedOut ? `no ${event} event within the timeout` : `saw ${event}`, { event: result });
+        const seen = await hypr.waitEvent(EVENTS[event], {
+          timeoutMs: clampInt(step.timeout_ms, BOUNDS.wait_ms),
+          ...(step.match ? { match: step.match } : {}),
+        });
+        return seen ? report(`saw ${event}`, { event: { event, data: clip(seen.data) } }) : report(`no ${event} event within the timeout`);
       }
       case "notify": {
         if (!step.text) throw new DesktopError("invalid", "notify needs text.");
@@ -481,18 +446,22 @@ export function createDesktop(deps: DesktopDeps) {
         ? "The screen is locked; nothing was done. Wait for the owner to unlock it."
         : "Neither Hyprland nor logind could say whether the screen is locked, so nothing was done.");
     }
-    lease.claim(caller);
+    await lease.claim(caller);
     const reports: StepReport[] = [];
     let lastWindow: string | undefined;
-    for (const [index, item] of steps.entries()) {
-      try {
-        reports.push(await step(item));
-        lastWindow = item.window ?? lastWindow;
-        lease.claim(caller);
-      } catch (error) {
-        const failure = error instanceof DesktopError ? error : new DesktopError("failed", error instanceof Error ? error.message : String(error));
-        return { steps: reports, failed: { index, error: failure } };
+    try {
+      for (const [index, item] of steps.entries()) {
+        try {
+          reports.push(await step(item));
+          lastWindow = item.window ?? lastWindow;
+        } catch (error) {
+          const failure = error instanceof DesktopError ? error : new DesktopError("failed", error instanceof Error ? error.message : String(error));
+          return { steps: reports, failed: { index, error: failure } };
+        }
       }
+    } finally {
+      // The idle clock starts when the input ends, not when it began.
+      await lease.claim(caller);
     }
     if (!args.then || args.then === "none") return { steps: reports };
     await sleep(150);
@@ -508,8 +477,6 @@ export function createDesktop(deps: DesktopDeps) {
     async close() {
       await atspi?.close().catch(() => {});
     },
-    /** For callers that want to know, before acting, whether a window can be seen. */
-    shown: async (query?: string) => windowShown(await window(query), await hypr.monitors()),
   };
 }
 

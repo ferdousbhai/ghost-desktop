@@ -3,8 +3,9 @@
  * serial-matched replies, and the wire marshalling of the basic type system.
  * Enough for AT-SPI; no signals, no fd passing, no server side.
  */
-import net from "node:net";
+import type { Socket } from "node:net";
 import { DesktopError } from "./errors.js";
+import { connectUnix, runtimeDir } from "./session.js";
 
 export interface Variant {
   readonly signature: string;
@@ -18,7 +19,7 @@ export function variant(signature: string, value: DBusValue): Variant {
   return { signature, value };
 }
 
-export function isVariant(value: unknown): value is Variant {
+function isVariant(value: unknown): value is Variant {
   return typeof value === "object" && value !== null && !Array.isArray(value) && "signature" in value && "value" in value;
 }
 
@@ -50,7 +51,7 @@ function completeTypeEnd(sig: string, start: number): number {
 }
 
 /** Split a signature into its complete types: `"sa{sv}(ii)"` → `["s", "a{sv}", "(ii)"]`. */
-export function splitSignature(sig: string): string[] {
+function splitSignature(sig: string): string[] {
   const types: string[] = [];
   for (let i = 0; i < sig.length;) {
     const end = completeTypeEnd(sig, i);
@@ -79,9 +80,6 @@ class Writer {
   view = new DataView(this.bytes.buffer);
   length = 0;
 
-  /** `base` is this buffer's offset within the message, for alignment. */
-  constructor(private readonly base = 0) {}
-
   private ensure(extra: number): void {
     if (this.length + extra <= this.bytes.length) return;
     let size = this.bytes.length * 2;
@@ -93,7 +91,7 @@ class Writer {
   }
 
   align(n: number): void {
-    const pad = (n - ((this.base + this.length) % n)) % n;
+    const pad = (n - (this.length % n)) % n;
     this.ensure(pad);
     this.bytes.fill(0, this.length, this.length + pad);
     this.length += pad;
@@ -187,11 +185,11 @@ function writeValue(w: Writer, type: string, value: DBusValue): void {
   }
 }
 
-/** Marshal `values` per `signature`; `base` is the offset the data starts at. */
-export function marshal(signature: string, values: readonly DBusValue[], base = 0): Uint8Array {
+/** Marshal `values` per `signature`, starting 8-aligned as a message body does. */
+export function marshal(signature: string, values: readonly DBusValue[]): Uint8Array {
   const types = splitSignature(signature);
   if (types.length !== values.length) throw new TypeError(`signature ${signature} needs ${types.length} values, got ${values.length}`);
-  const w = new Writer(base);
+  const w = new Writer();
   for (const [i, type] of types.entries()) writeValue(w, type, values[i] as DBusValue);
   return w.result();
 }
@@ -200,13 +198,13 @@ class Reader {
   readonly view: DataView;
   offset: number;
 
-  constructor(readonly bytes: Uint8Array, readonly le: boolean, start = 0, private readonly base = 0) {
+  constructor(readonly bytes: Uint8Array, readonly le: boolean, start = 0) {
     this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.offset = start;
   }
 
   align(n: number): void {
-    this.offset += (n - ((this.base + this.offset) % n)) % n;
+    this.offset += (n - (this.offset % n)) % n;
   }
 
   take(size: number): number {
@@ -264,18 +262,12 @@ function readValue(r: Reader, type: string): DBusValue {
   }
 }
 
-export function unmarshal(signature: string, bytes: Uint8Array, littleEndian = true): DBusValue[] {
-  const r = new Reader(bytes, littleEndian);
-  return splitSignature(signature).map((type) => readValue(r, type));
-}
-
 // --- messages ---------------------------------------------------------------
 
 export const MessageType = { MethodCall: 1, MethodReturn: 2, Error: 3, Signal: 4 } as const;
 
 export interface DBusMessage {
   readonly type: number;
-  readonly flags?: number;
   readonly serial: number;
   readonly path?: string;
   readonly interface?: string;
@@ -283,11 +275,11 @@ export interface DBusMessage {
   readonly errorName?: string;
   readonly replySerial?: number;
   readonly destination?: string;
-  readonly sender?: string;
   readonly signature?: string;
   readonly body?: readonly DBusValue[];
 }
 
+/** The header fields this client writes or reads; others are skipped. */
 const FIELDS = [
   [1, "path", "o"],
   [2, "interface", "s"],
@@ -295,7 +287,6 @@ const FIELDS = [
   [4, "errorName", "s"],
   [5, "replySerial", "u"],
   [6, "destination", "s"],
-  [7, "sender", "s"],
   [8, "signature", "g"],
 ] as const;
 
@@ -308,7 +299,7 @@ export function encodeMessage(message: DBusMessage): Uint8Array {
     if (value !== undefined) fields.push([code, variant(sig, value)]);
   }
   const w = new Writer();
-  w.raw(new Uint8Array([0x6c, message.type, message.flags ?? 0, 1]));
+  w.raw(new Uint8Array([0x6c, message.type, 0, 1]));
   w.put(4, (v, at) => v.setUint32(at, body.length, true));
   w.put(4, (v, at) => v.setUint32(at, message.serial, true));
   writeValue(w, "a(yv)", fields);
@@ -317,7 +308,7 @@ export function encodeMessage(message: DBusMessage): Uint8Array {
   return w.result();
 }
 
-/** Split complete messages off the front of `buffer`; the rest is an incomplete tail. */
+/** Split complete messages off the front of `buffer`; `rest` is the incomplete tail, not copied. */
 export function decodeMessages(buffer: Uint8Array): { messages: DBusMessage[]; rest: Uint8Array } {
   const messages: DBusMessage[] = [];
   let at = 0;
@@ -332,11 +323,7 @@ export function decodeMessages(buffer: Uint8Array): { messages: DBusMessage[]; r
     if (buffer.length - at < total) break;
     const frame = buffer.subarray(at, at + total);
     const header = new Reader(frame, le, 12);
-    const record: Record<string, unknown> = {
-      type: frame[1],
-      flags: frame[2],
-      serial: view.getUint32(8, le),
-    };
+    const record: Record<string, unknown> = { type: frame[1], serial: view.getUint32(8, le) };
     for (const field of readValue(header, "a(yv)") as DBusValue[][]) {
       const code = field[0] as number;
       const named = FIELDS.find(([c]) => c === code);
@@ -348,7 +335,7 @@ export function decodeMessages(buffer: Uint8Array): { messages: DBusMessage[]; r
     messages.push(record as unknown as DBusMessage);
     at += total;
   }
-  return { messages, rest: buffer.slice(at) };
+  return { messages, rest: buffer.subarray(at) };
 }
 
 // --- connection -------------------------------------------------------------
@@ -371,9 +358,7 @@ export function socketPathOf(address: string): string {
 }
 
 export function sessionBusAddress(env: NodeJS.ProcessEnv = process.env): string {
-  if (env.DBUS_SESSION_BUS_ADDRESS) return env.DBUS_SESSION_BUS_ADDRESS;
-  if (env.XDG_RUNTIME_DIR) return `unix:path=${env.XDG_RUNTIME_DIR}/bus`;
-  throw new DesktopError("unavailable", "No session bus: neither DBUS_SESSION_BUS_ADDRESS nor XDG_RUNTIME_DIR is set.");
+  return env.DBUS_SESSION_BUS_ADDRESS || `unix:path=${runtimeDir(env)}/bus`;
 }
 
 export interface CallOptions {
@@ -400,40 +385,26 @@ function uidHex(): string {
 export class DBusConnection {
   private serial = 0;
   private readonly pending = new Map<number, Pending>();
-  private buffer: Uint8Array = new Uint8Array(0);
+  // Received bytes not yet decoded: a growable buffer, so a large reply that
+  // arrives in many chunks is appended, not re-copied whole per chunk.
+  private buffer = new Uint8Array(4096);
+  private buffered = 0;
   private closedError: DBusError | null = null;
-  /** The unique name the bus assigned at Hello; empty for a peer connection. */
-  uniqueName = "";
 
-  private constructor(private readonly socket: net.Socket, private readonly defaultTimeoutMs: number) {}
+  private constructor(private readonly socket: Socket, private readonly defaultTimeoutMs: number) {}
 
-  /** Connect, authenticate, and (unless `hello: false`) register with the bus. */
-  static async connect(address: string, options: { timeoutMs?: number; hello?: boolean } = {}): Promise<DBusConnection> {
+  /** Connect, authenticate, and register with the bus (Hello). */
+  static async connect(address: string, options: { timeoutMs?: number } = {}): Promise<DBusConnection> {
     const path = socketPathOf(address);
     const timeoutMs = options.timeoutMs ?? 3000;
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
-      const s = net.createConnection({ path });
-      const timer = setTimeout(() => { s.destroy(); reject(new Error("timed out")); }, timeoutMs);
-      s.once("connect", () => { clearTimeout(timer); resolve(s); });
-      s.once("error", (error) => { clearTimeout(timer); reject(error); });
-    }).catch((error: Error) => {
-      const abstract = path.startsWith("\0") ? " (an abstract socket, which this runtime may not support)" : "";
-      throw new DesktopError("unavailable", `Cannot connect to the D-Bus socket ${path.replace("\0", "@")}${abstract}: ${error.message}.`, { address });
-    });
+    const abstract = path.startsWith("\0") ? " (an abstract socket, which this runtime may not support)" : "";
+    const socket = await connectUnix(path, `The D-Bus socket${abstract}`, timeoutMs);
     const connection = new DBusConnection(socket, timeoutMs);
     await connection.authenticate(timeoutMs).catch((error: Error) => {
       socket.destroy();
       throw new DesktopError("unavailable", `D-Bus authentication failed on ${address}: ${error.message}.`, { address });
     });
-    if (options.hello !== false) {
-      const [name] = await connection.call({
-        destination: "org.freedesktop.DBus",
-        path: "/org/freedesktop/DBus",
-        interface: "org.freedesktop.DBus",
-        member: "Hello",
-      });
-      connection.uniqueName = String(name);
-    }
+    await connection.call({ destination: "org.freedesktop.DBus", path: "/org/freedesktop/DBus", interface: "org.freedesktop.DBus", member: "Hello" });
     return connection;
   }
 
@@ -469,18 +440,28 @@ export class DBusConnection {
   }
 
   private receive(chunk: Uint8Array): void {
-    const joined = new Uint8Array(this.buffer.length + chunk.length);
-    joined.set(this.buffer);
-    joined.set(chunk, this.buffer.length);
+    if (this.buffered + chunk.length > this.buffer.length) {
+      let size = this.buffer.length * 2;
+      while (size < this.buffered + chunk.length) size *= 2;
+      const grown = new Uint8Array(size);
+      grown.set(this.buffer.subarray(0, this.buffered));
+      this.buffer = grown;
+    }
+    this.buffer.set(chunk, this.buffered);
+    this.buffered += chunk.length;
     let decoded: ReturnType<typeof decodeMessages>;
     try {
-      decoded = decodeMessages(joined);
+      decoded = decodeMessages(this.buffer.subarray(0, this.buffered));
     } catch (error) {
       this.fail((error as Error).message);
       this.socket.destroy();
       return;
     }
-    this.buffer = decoded.rest;
+    // Move only the undecoded tail to the front, and only when a message was consumed.
+    if (decoded.rest.length !== this.buffered) {
+      this.buffer.copyWithin(0, this.buffered - decoded.rest.length, this.buffered);
+      this.buffered = decoded.rest.length;
+    }
     for (const message of decoded.messages) {
       if (message.replySerial === undefined) continue;
       const waiter = this.pending.get(message.replySerial);
@@ -530,28 +511,6 @@ export class DBusConnection {
       }, timeoutMs);
       this.pending.set(serial, { resolve, reject, timer });
       this.socket.write(frame);
-    });
-  }
-
-  /** `org.freedesktop.DBus.Properties.Get`, unwrapped from its variant. */
-  async getProperty(destination: string, path: string, iface: string, property: string): Promise<DBusValue> {
-    const [value] = await this.call({
-      destination, path,
-      interface: "org.freedesktop.DBus.Properties",
-      member: "Get",
-      signature: "ss",
-      body: [iface, property],
-    });
-    return isVariant(value) ? value.value : (value as DBusValue);
-  }
-
-  async setProperty(destination: string, path: string, iface: string, property: string, value: Variant): Promise<void> {
-    await this.call({
-      destination, path,
-      interface: "org.freedesktop.DBus.Properties",
-      member: "Set",
-      signature: "ssv",
-      body: [iface, property, value],
     });
   }
 

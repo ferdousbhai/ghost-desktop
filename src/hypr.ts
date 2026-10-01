@@ -1,7 +1,10 @@
+import type { Socket } from "node:net";
+import { join } from "node:path";
 import { DesktopError } from "./errors.js";
 import { runCommand, type Runner } from "./run.js";
+import { connectUnix, runtimeDir } from "./session.js";
 
-/** One window as `hyprctl -j clients` reports it, trimmed to what we use. */
+/** One window as Hyprland reports it, trimmed to what we use. */
 export interface HyprClient {
   address: string;
   class: string;
@@ -10,7 +13,6 @@ export interface HyprClient {
   at: [number, number];
   size: [number, number];
   workspace: { id: number; name: string };
-  monitor: number;
   floating: boolean;
   fullscreen: number;
   hidden: boolean;
@@ -19,11 +21,9 @@ export interface HyprClient {
   /** Hyprland 0.56+ spells it stableId; earlier builds stable_id. */
   stableId?: string;
   stable_id?: string;
-  xwayland?: boolean;
 }
 
 export interface HyprMonitor {
-  id: number;
   name: string;
   x: number;
   y: number;
@@ -36,7 +36,6 @@ export interface HyprMonitor {
 }
 
 export interface HyprLayer {
-  address: string;
   namespace: string;
   x: number;
   y: number;
@@ -62,12 +61,9 @@ export function luaString(text: string): string {
   return `"${body}"`;
 }
 
-function luaTable(fields: Record<string, string | number | boolean | undefined>): string {
-  const body = Object.entries(fields)
-    .filter(([, value]) => value !== undefined)
-    .map(([name, value]) => `${name} = ${typeof value === "string" ? luaString(value) : String(value)}`)
-    .join(", ");
-  return `{ ${body} }`;
+function luaTable(fields: Record<string, string | number | boolean>): string {
+  const body = Object.entries(fields).map(([name, value]) => `${name} = ${typeof value === "string" ? luaString(value) : String(value)}`);
+  return `{ ${body.join(", ")} }`;
 }
 
 function windowSelector(address: string): string {
@@ -90,40 +86,49 @@ export type Intent =
   | { kind: "cursor"; x: number; y: number }
   | { kind: "shortcut"; mods: string; key: string; address: string };
 
-export function encodeIntent(intent: Intent, lua: boolean): string[] {
+/** The argument of `dispatch`: one Lua call, or a legacy dispatcher and its argument. */
+export function encodeIntent(intent: Intent, lua: boolean): string {
+  const call = (fn: string, fields: Record<string, string | number | boolean>) => `hl.dsp.${fn}(${luaTable(fields)})`;
   switch (intent.kind) {
-    case "focus":
-      return lua ? [`hl.dsp.focus(${luaTable({ window: windowSelector(intent.address) })})`] : ["focuswindow", windowSelector(intent.address)];
-    case "workspace": {
-      const value = workspaceValue(intent.workspace);
-      return lua ? [`hl.dsp.focus({ workspace = ${typeof value === "number" ? value : luaString(value)} })`] : ["workspace", intent.workspace];
+    case "focus": {
+      const window = windowSelector(intent.address);
+      return lua ? call("focus", { window }) : `focuswindow ${window}`;
     }
+    case "workspace":
+      return lua ? call("focus", { workspace: workspaceValue(intent.workspace) }) : `workspace ${intent.workspace}`;
     case "move": {
-      const value = workspaceValue(intent.workspace);
+      const window = windowSelector(intent.address);
       // follow = false is the silent move; anything else drags the owner's view along.
       return lua
-        ? [`hl.dsp.window.move({ workspace = ${typeof value === "number" ? value : luaString(value)}, window = ${luaString(windowSelector(intent.address))}, follow = false })`]
-        : ["movetoworkspacesilent", `${intent.workspace},${windowSelector(intent.address)}`];
+        ? call("window.move", { workspace: workspaceValue(intent.workspace), window, follow: false })
+        : `movetoworkspacesilent ${intent.workspace},${window}`;
     }
-    case "close":
-      return lua ? [`hl.dsp.window.close(${luaTable({ window: windowSelector(intent.address) })})`] : ["closewindow", windowSelector(intent.address)];
+    case "close": {
+      const window = windowSelector(intent.address);
+      return lua ? call("window.close", { window }) : `closewindow ${window}`;
+    }
     case "fullscreen":
-      return lua
-        ? [`hl.dsp.window.fullscreen(${luaTable({ mode: "fullscreen", action: "toggle", window: windowSelector(intent.address) })})`]
-        : ["fullscreen", "0"];
-    case "float":
-      return lua ? [`hl.dsp.window.float(${luaTable({ action: "toggle", window: windowSelector(intent.address) })})`] : ["togglefloating", windowSelector(intent.address)];
+      return lua ? call("window.fullscreen", { mode: "fullscreen", action: "toggle", window: windowSelector(intent.address) }) : "fullscreen 0";
+    case "float": {
+      const window = windowSelector(intent.address);
+      return lua ? call("window.float", { action: "toggle", window }) : `togglefloating ${window}`;
+    }
     case "exec":
-      return lua ? [`hl.dsp.exec_cmd(${luaString(intent.command)})`] : ["exec", intent.command];
-    case "cursor":
-      return lua
-        ? [`hl.dsp.cursor.move({ x = ${Math.round(intent.x)}, y = ${Math.round(intent.y)} })`]
-        : ["movecursor", String(Math.round(intent.x)), String(Math.round(intent.y))];
-    case "shortcut":
-      return lua
-        ? [`hl.dsp.send_shortcut(${luaTable({ mods: intent.mods, key: intent.key, window: windowSelector(intent.address) })})`]
-        : ["sendshortcut", `${intent.mods},${intent.key},${windowSelector(intent.address)}`];
+      return lua ? `hl.dsp.exec_cmd(${luaString(intent.command)})` : `exec ${intent.command}`;
+    case "cursor": {
+      const [x, y] = [Math.round(intent.x), Math.round(intent.y)];
+      return lua ? call("cursor.move", { x, y }) : `movecursor ${x} ${y}`;
+    }
+    case "shortcut": {
+      const window = windowSelector(intent.address);
+      return lua ? call("send_shortcut", { mods: intent.mods, key: intent.key, window }) : `sendshortcut ${intent.mods},${intent.key},${window}`;
+    }
   }
+}
+
+export interface HyprEvent {
+  readonly name: string;
+  readonly data: string;
 }
 
 export interface Hypr {
@@ -135,29 +140,67 @@ export interface Hypr {
   /** True locked, false unlocked, null when nothing could tell. */
   locked(): Promise<boolean | null>;
   dispatch(intent: Intent): Promise<void>;
+  /**
+   * The first event named in `names` whose data contains `match`, or null at
+   * the timeout. `after` runs once the listener is connected, so an event it
+   * causes cannot be missed.
+   */
+  waitEvent(names: readonly string[], options: { match?: string; timeoutMs: number; after?: () => Promise<void> }): Promise<HyprEvent | null>;
 }
 
-export function createHypr(run: Runner = runCommand, env: NodeJS.ProcessEnv = process.env): Hypr {
+/** Sends one request on Hyprland's request socket and returns the whole reply. */
+export type HyprRequest = (command: string) => Promise<string>;
+
+function socketDir(env: NodeJS.ProcessEnv): string {
+  const signature = env.HYPRLAND_INSTANCE_SIGNATURE;
+  if (!signature) throw new DesktopError("unavailable", "HYPRLAND_INSTANCE_SIGNATURE is unset; this is not a Hyprland session.");
+  return join(runtimeDir(env), "hypr", signature);
+}
+
+/** Hyprland's own request socket: what `hyprctl` speaks, without a process per call. */
+export function socketRequest(env: NodeJS.ProcessEnv): HyprRequest {
+  return async (command) => {
+    const socket = await connectUnix(join(socketDir(env), ".socket.sock"), "Hyprland");
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new DesktopError("failed", `Hyprland did not answer ${command.split(" ", 1)[0]}.`));
+      }, 5000);
+      socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+      socket.once("close", () => {
+        clearTimeout(timer);
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      });
+      socket.end(command);
+    });
+  };
+}
+
+/** `hyprctl locked` and logind's LockedHint each answer yes, no, or nothing. */
+const verdict = (text: string | null, yes: RegExp, no: RegExp): boolean | null =>
+  text === null ? null : yes.test(text.trim()) ? true : no.test(text.trim()) ? false : null;
+
+export function createHypr(options: { env?: NodeJS.ProcessEnv; request?: HyprRequest; run?: Runner } = {}): Hypr {
+  const env = options.env ?? process.env;
+  const request = options.request ?? socketRequest(env);
+  const run = options.run ?? runCommand;
   let lua: boolean | undefined;
 
   const json = async <T>(what: string): Promise<T> => {
-    const result = await run(["hyprctl", "-j", what], { timeoutMs: 5000 });
-    if (result.code !== 0) {
-      throw new DesktopError("unavailable", `hyprctl ${what} failed: ${(result.stderr || result.stdout).trim().slice(0, 200)}. Is this a Hyprland session?`);
-    }
+    const reply = await request(`j/${what}`);
     try {
-      return JSON.parse(result.stdout) as T;
+      return JSON.parse(reply) as T;
     } catch {
-      throw new DesktopError("unavailable", `hyprctl ${what} did not answer with JSON; this is not a Hyprland session.`);
+      throw new DesktopError("unavailable", `Hyprland answered ${what} without JSON: ${reply.slice(0, 120)}`);
     }
   };
 
-  // `-j status` names the config manager; pre-0.56 answers "unknown request", which means legacy strings.
+  // `status` names the config manager; before 0.56 it is an unknown request, which means legacy strings.
   const provider = async (): Promise<boolean> => {
     if (lua === undefined) {
-      const result = await run(["hyprctl", "-j", "status"], { timeoutMs: 5000 });
       try {
-        lua = (JSON.parse(result.stdout) as { configProvider?: string }).configProvider === "lua";
+        lua = (await json<{ configProvider?: string }>("status")).configProvider === "lua";
       } catch {
         lua = false;
       }
@@ -169,8 +212,7 @@ export function createHypr(run: Runner = runCommand, env: NodeJS.ProcessEnv = pr
     clients: () => json<HyprClient[]>("clients"),
     monitors: () => json<HyprMonitor[]>("monitors"),
     async activeAddress() {
-      const active = await json<{ address?: string }>("activewindow");
-      return active.address ?? null;
+      return (await json<{ address?: string }>("activewindow")).address ?? null;
     },
     async layers() {
       const raw = await json<Record<string, { levels: Record<string, Array<Omit<HyprLayer, "level" | "monitor">>> }>>("layers");
@@ -182,27 +224,50 @@ export function createHypr(run: Runner = runCommand, env: NodeJS.ProcessEnv = pr
       return [pos.x, pos.y];
     },
     async locked() {
+      const session = env.XDG_SESSION_ID ? [env.XDG_SESSION_ID] : [];
       const [hypr, logind] = await Promise.all([
-        run(["hyprctl", "locked"], { timeoutMs: 3000 }).then(
-          (result) => (result.code === 0 ? /^true$/i.test(result.stdout.trim()) ? true : /^false$/i.test(result.stdout.trim()) ? false : null : null),
-          () => null,
-        ),
-        run(["loginctl", "show-session", ...(env.XDG_SESSION_ID ? [env.XDG_SESSION_ID] : []), "-p", "LockedHint", "--value"], { timeoutMs: 3000 }).then(
-          (result) => (result.code === 0 ? /^(yes|true|1)$/i.test(result.stdout.trim()) ? true : /^(no|false|0)$/i.test(result.stdout.trim()) ? false : null : null),
-          () => null,
-        ),
+        request("locked").catch(() => null),
+        run(["loginctl", "show-session", ...session, "-p", "LockedHint", "--value"], { timeoutMs: 3000 })
+          .then((result) => (result.code === 0 ? result.stdout : null), () => null),
       ]);
-      if (hypr === true || logind === true) return true;
-      if (hypr === null && logind === null) return null;
-      return false;
+      const fromHypr = verdict(hypr, /^true$/i, /^false$/i);
+      const fromLogind = verdict(logind, /^(yes|true|1)$/i, /^(no|false|0)$/i);
+      if (fromHypr === true || fromLogind === true) return true;
+      return fromHypr === null && fromLogind === null ? null : false;
     },
     async dispatch(intent) {
-      const argv = ["hyprctl", "dispatch", ...encodeIntent(intent, await provider())];
-      const result = await run(argv, { timeoutMs: 5000 });
-      const out = result.stdout.trim();
-      if (result.code !== 0 || out !== "ok") {
-        throw new DesktopError("failed", `Hyprland refused ${intent.kind}: ${(out || result.stderr).slice(0, 200)}`);
+      const reply = (await request(`dispatch ${encodeIntent(intent, await provider())}`)).trim();
+      if (reply !== "ok") throw new DesktopError("failed", `Hyprland refused ${intent.kind}: ${reply.slice(0, 200)}`);
+    },
+    async waitEvent(names, { match, timeoutMs, after }) {
+      const socket: Socket = await connectUnix(join(socketDir(env), ".socket2.sock"), "Hyprland's event socket");
+      const folded = match?.toLowerCase();
+      const seen = new Promise<HyprEvent | null>((resolve) => {
+        let buffer = "";
+        const finish = (event: HyprEvent | null) => {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(event);
+        };
+        const timer = setTimeout(() => finish(null), timeoutMs);
+        socket.on("close", () => finish(null));
+        socket.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString("utf8");
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            const [name = "", data = ""] = line.split(">>", 2);
+            if (names.includes(name) && (!folded || data.toLowerCase().includes(folded))) return finish({ name, data });
+          }
+        });
+      });
+      try {
+        await after?.();
+      } catch (error) {
+        socket.destroy();
+        throw error;
       }
+      return seen;
     },
   };
 }

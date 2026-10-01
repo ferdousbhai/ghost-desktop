@@ -16,16 +16,16 @@ function lease(clock: { now: number }) {
 }
 
 describe("DesktopLease", () => {
-  it("is shared through the file, so two processes take turns", () => {
+  it("is shared through the file, so two processes take turns", async () => {
     const clock = { now: 1000 };
     const [a, b] = lease(clock);
-    a.claim("ghost dous");
-    expect(() => b.claim("claude-code 1234")).toThrow(/ghost dous\) is steering/);
+    await a.claim("ghost dous");
+    await expect(b.claim("claude-code 1234")).rejects.toThrow(/ghost dous\) is steering/);
     expect(b.peek()).toMatchObject({ holder: "ghost dous" });
     clock.now += LEASE_IDLE_MS - 1;
-    a.claim("ghost dous");
+    await a.claim("ghost dous");
     clock.now += LEASE_IDLE_MS;
-    b.claim("claude-code 1234");
-    expect(() => a.claim("ghost dous")).toThrow(expect.objectContaining({ code: "busy" }));
+    await b.claim("claude-code 1234");
+    await expect(a.claim("ghost dous")).rejects.toMatchObject({ code: "busy" });
   });
 });

@@ -1,14 +1,29 @@
 #!/usr/bin/env bun
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import packageJson from "../package.json" with { type: "json" };
-import { createServer, openDesktop } from "./index.js";
+import { createAtspi } from "./atspi.js";
+import { createCapture } from "./capture.js";
+import { createDesktop } from "./desktop.js";
+import { createHypr } from "./hypr.js";
+import { DesktopLease, leaseDir } from "./lease.js";
+import { runCommand } from "./run.js";
+import { createServer } from "./server.js";
+import { openVirtualPointer } from "./wayland.js";
 
 if (process.argv.includes("--version")) {
   console.log(packageJson.version);
   process.exit(0);
 }
 
-const desktop = openDesktop();
+const env = process.env;
+const desktop = createDesktop({
+  hypr: createHypr({ env }),
+  capture: createCapture(runCommand),
+  atspi: () => createAtspi(env),
+  pointer: () => openVirtualPointer(env),
+  lease: new DesktopLease(leaseDir(env)),
+  run: runCommand,
+});
 const server = createServer(desktop, packageJson.version);
 const { promise: closed, resolve } = Promise.withResolvers<void>();
 server.onclose = resolve;
