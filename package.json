@@ -1,22 +1,26 @@
 {
-  "name": "@ghost/desktop",
-  "version": "0.4.3",
-  "private": true,
+  "name": "ghost-desktop",
+  "version": "0.1.0",
   "license": "Apache-2.0",
-  "description": "ghost-desktop: Hyprland computer use as a stdio MCP server — look at and act on the desktop.",
+  "description": "Computer use for Hyprland and Omarchy as a stdio MCP server: two tools, desktop_look and desktop_act.",
   "type": "module",
   "bin": {
     "ghost-desktop": "./src/main.ts"
   },
   "files": [
-    "src"
+    "src",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md"
   ],
   "engines": {
     "bun": ">=1.3.14"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "bun --bun ./node_modules/vitest/vitest.mjs run"
+    "lint": "biome check . --diagnostic-level=warn --error-on-warnings",
+    "test": "bun --bun ./node_modules/vitest/vitest.mjs run",
+    "verify": "bun run typecheck && bun run lint && bun run test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"
@@ -25,6 +29,11 @@
     "@types/bun": "^1.3.14",
     "@types/node": "^22.15.3",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "@biomejs/biome": "^2.5.10"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ferdousbhai/ghost-desktop.git"
   }
 }
