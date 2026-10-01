@@ -4,7 +4,7 @@
  * screen coordinates: AT-SPI's window-relative extents plus the window's
  * Hyprland position, because Wayland clients cannot report screen positions.
  */
-import { DBusConnection, DBusError, isVariant, sessionBusAddress, variant, type DBusValue } from "./dbus.js";
+import { DBusConnection, DBusError, DISCONNECTED, isVariant, sessionBusAddress, variant, type DBusValue } from "./dbus.js";
 import { DesktopError } from "./errors.js";
 
 export interface AxWindow {
@@ -311,7 +311,7 @@ export function createAtspi(env: NodeJS.ProcessEnv): Atspi {
       try {
         read_ = await read(conn, target, at, withText);
       } catch (error) {
-        if (error instanceof DBusError && error.dbusName === "org.ghost.Disconnected") throw error;
+        if (error instanceof DBusError && error.dbusName === DISCONNECTED) throw error;
         return null;
       }
       // A hidden element's subtree is not on screen; skip it.

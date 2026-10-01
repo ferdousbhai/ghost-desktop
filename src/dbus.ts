@@ -23,7 +23,10 @@ export function isVariant(value: unknown): value is Variant {
   return typeof value === "object" && value !== null && !Array.isArray(value) && "signature" in value && "value" in value;
 }
 
-/** A D-Bus error reply, or a lost connection (`org.ghost.Disconnected`). */
+/** The error name a call fails with when its connection is lost. */
+export const DISCONNECTED = "org.ghost.Disconnected";
+
+/** A D-Bus error reply, or a lost connection (`DISCONNECTED`). */
 export class DBusError extends Error {
   constructor(readonly dbusName: string, message: string) {
     super(message);
@@ -463,7 +466,7 @@ export class DBusConnection {
 
   private fail(reason: string): void {
     if (this.closedError) return;
-    this.closedError = new DBusError("org.ghost.Disconnected", `D-Bus connection lost: ${reason}`);
+    this.closedError = new DBusError(DISCONNECTED, `D-Bus connection lost: ${reason}`);
     for (const [serial, waiter] of this.pending) {
       clearTimeout(waiter.timer);
       waiter.reject(this.closedError);

@@ -16,6 +16,7 @@ export const BOUNDS = {
   frames: [1, 12, 1],
   interval_ms: [100, 5000, 500],
   clicks: [1, 3, 1],
+  scale: [0.1, 2, 1],
   wait_ms: [...TIMEOUT_RANGE, 10_000],
   launch_ms: [...TIMEOUT_RANGE, 8000],
 } as const;
@@ -204,7 +205,8 @@ export function createDesktop(deps: DesktopDeps) {
   }
 
   function shot(args: LookArgs, client: HyprClient | undefined, monitors: readonly HyprMonitor[]): Promise<Shot> {
-    const options = { ...(args.lossless ? { lossless: true } : {}), ...(args.scale !== undefined ? { scale: args.scale } : {}) };
+    const [min, max, fallback] = BOUNDS.scale;
+    const options = { lossless: args.lossless === true, scale: Math.min(Math.max(min, args.scale ?? fallback), max) };
     if (args.region) return capture.region(parseRegion(args.region), options);
     if (client) return capture.window(client, monitors, options);
     const monitor = args.monitor

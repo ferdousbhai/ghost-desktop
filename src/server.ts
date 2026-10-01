@@ -9,7 +9,8 @@ export const LOOK = "desktop_look";
 export const ACT = "desktop_act";
 
 const str = (description: string) => ({ type: "string", description });
-const num = (description: string) => ({ type: "number", description });
+const num = (description: string, bounds?: readonly [number, number, number]) =>
+  ({ type: "number", description, ...(bounds ? { minimum: bounds[0], maximum: bounds[1] } : {}) });
 const int = (description: string, [minimum, maximum]: readonly [number, number, number]) => ({ type: "integer", minimum, maximum, description });
 const bool = (description: string) => ({ type: "boolean", description });
 
@@ -37,7 +38,7 @@ export const TOOLS = [
         image: bool("Take a screenshot."),
         region: str("Screenshot this screen rectangle, \"x,y WxH\"."),
         monitor: str("Screenshot this monitor by name."),
-        scale: num("Image pixels per screen unit, 0.1-2; default 1."),
+        scale: num(`Image pixels per screen unit; default ${BOUNDS.scale[2]}.`, BOUNDS.scale),
         lossless: bool("PNG instead of JPEG, for pixel-exact reading."),
         frames: int("Shots to take, default 1.", BOUNDS.frames),
         interval_ms: int(`Between frames, default ${BOUNDS.interval_ms[2]}.`, BOUNDS.interval_ms),

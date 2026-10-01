@@ -18,7 +18,7 @@ export interface Shot {
 
 export interface CaptureOptions {
   readonly lossless?: boolean;
-  /** Image pixels per desktop unit, 0.1–2; default 1 (logical size). */
+  /** Image pixels per desktop unit; default 1 (logical size). The caller bounds it. */
   readonly scale?: number;
 }
 
@@ -49,7 +49,6 @@ export function createCapture(run: Runner) {
     warnings: string[] = [],
   ): Promise<Shot> => {
     const scale = options.scale ?? 1;
-    if (!(scale >= 0.1 && scale <= 2)) throw new DesktopError("invalid", "scale must be between 0.1 and 2.");
     const format = options.lossless ? ["-t", "png"] : ["-t", "jpeg", "-q", "90"];
     const { bytes } = await runChecked(run, ["grim", "-s", String(scale), ...format, ...args, "-"], { timeoutMs: 8000, binary: true });
     if (!bytes?.length) throw new DesktopError("failed", "grim returned no image.");
