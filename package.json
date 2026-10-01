@@ -1,6 +1,6 @@
 {
   "name": "ghost-desktop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "Apache-2.0",
   "description": "Computer use for Hyprland and Omarchy as a stdio MCP server: two tools, desktop_look and desktop_act.",
   "type": "module",

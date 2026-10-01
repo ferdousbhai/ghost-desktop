@@ -11,8 +11,7 @@ import { createServer } from "./server.js";
 import { sessionEnv } from "./session.js";
 import { openVirtualPointer } from "./wayland.js";
 
-// The runtime build stamps the release version; a source checkout reads its manifest.
-const version = process.env.GHOSTD_VERSION ?? packageJson.version;
+const { version } = packageJson;
 
 if (process.argv.includes("--version")) {
   console.log(version);
