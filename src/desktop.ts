@@ -357,7 +357,8 @@ export function createDesktop(deps: DesktopDeps) {
           await ax().focus(element.ref);
         }
         await focusIfNeeded(step.window, disturbed);
-        await runChecked(run, ["wtype", "-"], { stdin: step.text, timeoutMs: 15_000 });
+        // As an argument: wtype reading stdin drops characters first seen past ~100 in.
+        await runChecked(run, ["wtype", "--", step.text], { timeoutMs: 15_000 });
         return report(`typed ${step.text.length} characters into the focused field`);
       }
       case "key": {

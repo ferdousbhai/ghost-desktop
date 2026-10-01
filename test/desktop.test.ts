@@ -134,6 +134,13 @@ describe("desktop_act", () => {
     expect(result.failed).toMatchObject({ index: 1, error: { code: "not_found" } });
   });
 
+  it("types long text as wtype's argument, never through stdin", async () => {
+    const { desktop, commands } = harness();
+    const text = `${"ab".repeat(60)}XYZ`;
+    await desktop.act({ steps: [{ do: "type", text }] }, "a");
+    expect(commands.at(-1)).toEqual(["wtype", "--", text]);
+  });
+
   it("drags with intermediate motion and always releases", async () => {
     const { desktop, dispatched, pointerCalls } = harness();
     await desktop.act({ steps: [{ do: "drag", x: 0, y: 0, to_x: 120, to_y: 0 }] }, "a");
