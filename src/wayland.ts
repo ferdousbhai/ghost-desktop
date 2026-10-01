@@ -136,6 +136,7 @@ class Connection {
   private nextId = 2;
   private failure: DesktopError | undefined;
   private readonly waiters = new Set<() => void>();
+  private readonly doneCallbacks = new Set<number>();
   readonly globals: Array<{ name: number; iface: string; version: number }> = [];
   registry = 0;
 
@@ -156,8 +157,6 @@ class Connection {
       this.wake();
     });
   }
-
-  private readonly doneCallbacks = new Set<number>();
 
   private handle({ objectId, opcode, body }: WireEvent): void {
     if (objectId === DISPLAY_ID && opcode === EV_ERROR) {

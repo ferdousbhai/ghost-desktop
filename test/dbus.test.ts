@@ -88,10 +88,10 @@ afterEach(() => {
   conns = [];
 });
 
-async function connect(handler: Parameters<typeof fakeBus>[0]): Promise<DBusConnection> {
+async function connect(handler: Parameters<typeof fakeBus>[0], timeoutMs?: number): Promise<DBusConnection> {
   const bus = await fakeBus(handler);
   buses.push(bus);
-  const conn = await DBusConnection.connect(bus.address);
+  const conn = await DBusConnection.connect(bus.address, timeoutMs === undefined ? {} : { timeoutMs });
   conns.push(conn);
   return conn;
 }
@@ -117,10 +117,11 @@ describe("DBusConnection", () => {
   });
 
   it("times out a call that gets no reply, and fails pending calls on close", async () => {
-    const conn = await connect(() => null);
-    await expect(conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Slow", timeoutMs: 50 }))
+    const quick = await connect(() => null, 50);
+    await expect(quick.call({ destination: "d", path: "/p", interface: "i.I", member: "Slow" }))
       .rejects.toThrow(/no reply within 50ms/);
-    const pending = conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Slow", timeoutMs: 5000 });
+    const conn = await connect(() => null);
+    const pending = conn.call({ destination: "d", path: "/p", interface: "i.I", member: "Slow" });
     conn.close();
     await expect(pending).rejects.toBeInstanceOf(DBusError);
   });

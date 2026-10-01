@@ -7,14 +7,17 @@ import type { DesktopLease } from "./lease.js";
 import { runChecked, type Runner } from "./run.js";
 import type { MouseButton, VirtualPointer } from "./wayland.js";
 
+/** wait and launch share one timeout_ms argument, so one range. */
+const TIMEOUT_RANGE = [100, 60_000] as const;
+
 /** Bounds the schema advertises and the steps enforce: [min, max, default]. */
 export const BOUNDS = {
   elements: [1, 200, 40],
   frames: [1, 12, 1],
   interval_ms: [100, 5000, 500],
   clicks: [1, 3, 1],
-  wait_ms: [100, 60_000, 10_000],
-  launch_ms: [100, 60_000, 8000],
+  wait_ms: [...TIMEOUT_RANGE, 10_000],
+  launch_ms: [...TIMEOUT_RANGE, 8000],
 } as const;
 export const MAX_STEPS = 30;
 const MAX_WINDOWS = 60;
@@ -265,7 +268,6 @@ export function createDesktop(deps: DesktopDeps) {
     return { facts, images };
   }
 
-  /** The one control a step's name picks in its window; an ambiguous name lists refs instead. */
   /** The one control a step's name picks in its window; an ambiguous name lists refs instead. */
   async function named(step: ActStep): Promise<Located & { element: AxElement }> {
     if (!step.name) throw new DesktopError("invalid", `${step.do} needs ref or name (a control from look with ui), or x and y.`);

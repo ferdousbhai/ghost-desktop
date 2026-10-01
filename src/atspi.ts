@@ -199,9 +199,12 @@ export function createAtspi(env: NodeJS.ProcessEnv): Atspi {
   }
 
   async function bus(): Promise<DBusConnection> {
-    if (connecting) {
-      const existing = await connecting.catch(() => null);
+    const seen = connecting;
+    if (seen) {
+      const existing = await seen.catch(() => null);
       if (existing && !existing.closed) return existing;
+      // Another call reopened it while this one waited: share that, never open a second.
+      if (connecting !== seen && connecting) return connecting;
     }
     connecting = openBus();
     return connecting;

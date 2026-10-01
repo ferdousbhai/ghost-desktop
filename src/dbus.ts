@@ -368,7 +368,6 @@ export interface CallOptions {
   readonly member: string;
   readonly signature?: string;
   readonly body?: readonly DBusValue[];
-  readonly timeoutMs?: number;
 }
 
 interface Pending {
@@ -489,7 +488,7 @@ export class DBusConnection {
       ...(options.signature ? { signature: options.signature, body: options.body ?? [] } : {}),
     });
     return new Promise((resolve, reject) => {
-      const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
+      const timeoutMs = this.defaultTimeoutMs;
       const timer = setTimeout(() => {
         this.pending.delete(serial);
         reject(new DBusError("org.freedesktop.DBus.Error.Timeout", `${options.interface}.${options.member} got no reply within ${timeoutMs}ms`));

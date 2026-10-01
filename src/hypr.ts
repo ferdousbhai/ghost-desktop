@@ -74,6 +74,8 @@ function workspaceValue(workspace: string): string | number {
   return /^-?\d+$/.test(workspace) ? Number(workspace) : workspace;
 }
 
+// The Lua dispatch encoding is ported from hypruse (MIT, Ilyas Khallouki).
+
 /** A desktop intent in both dispatch grammars: Lua (0.56+) and the legacy strings. */
 export type Intent =
   | { kind: "focus"; address: string }
