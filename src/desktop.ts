@@ -64,7 +64,7 @@ export interface ActStep {
   dx?: number;
   workspace?: string;
   command?: string;
-  event?: "open" | "close" | "title" | "workspace";
+  event?: keyof typeof EVENTS;
   match?: string;
   timeout_ms?: number;
   title?: string;
@@ -72,7 +72,7 @@ export interface ActStep {
 
 export interface ActArgs {
   steps: ActStep[];
-  then?: "none" | "desktop" | "ui" | "image";
+  then?: (typeof THEN_LOOKS)[number];
 }
 
 export interface Observation {
@@ -90,6 +90,14 @@ export interface StepReport {
   event?: Record<string, unknown>;
 }
 
+/** A control found for a step: its ref, its window, and its screen box if it has one. */
+interface Located {
+  ref: string;
+  client: HyprClient;
+  active: string | null;
+  box?: [number, number, number, number] | undefined;
+}
+
 export interface DesktopDeps {
   readonly hypr: Hypr;
   readonly capture: Capture;
@@ -101,6 +109,8 @@ export interface DesktopDeps {
 }
 
 const EVENTS = { open: ["openwindow"], close: ["closewindow"], title: ["windowtitlev2", "windowtitle"], workspace: ["workspacev2", "workspace"] } as const;
+export const WAIT_EVENTS = Object.keys(EVENTS) as Array<keyof typeof EVENTS>;
+export const THEN_LOOKS = ["none", "desktop", "ui", "image"] as const;
 
 const clip = (text: string | undefined, max = MAX_TEXT) => (text && text.length > max ? `${text.slice(0, max - 1)}…` : text ?? "");
 
@@ -256,15 +266,16 @@ export function createDesktop(deps: DesktopDeps) {
   }
 
   /** The one control a step's name picks in its window; an ambiguous name lists refs instead. */
-  async function named(step: ActStep): Promise<{ element: AxElement; client: HyprClient; active: string | null }> {
+  /** The one control a step's name picks in its window; an ambiguous name lists refs instead. */
+  async function named(step: ActStep): Promise<Located & { element: AxElement }> {
     if (!step.name) throw new DesktopError("invalid", `${step.do} needs ref or name (a control from look with ui), or x and y.`);
     const { client, active } = await window(step.window);
-    const { elements } = await ax().query(client, { text: step.name, limit: 20 });
+    const { elements } = await ax().query(client, { name: step.name, limit: 20 });
     const folded = step.name.toLowerCase();
     const exact = elements.filter((element) => element.name.toLowerCase() === folded);
     const candidates = exact.length ? exact : elements;
     const [only] = candidates;
-    if (only && candidates.length === 1) return { element: only, client, active };
+    if (only && candidates.length === 1) return { element: only, ref: only.ref, client, active, box: only.box };
     if (candidates.length === 0) throw new DesktopError("not_found", `No control named ${JSON.stringify(step.name)} in ${client.class}; look with ui to see what it offers, or use an image.`);
     throw new DesktopError(
       "invalid",
@@ -273,30 +284,21 @@ export function createDesktop(deps: DesktopDeps) {
     );
   }
 
-  const refOf = async (step: ActStep) => step.ref ?? (await named(step)).element.ref;
-
-  /** The screen point a click aims at, with its window brought forward. */
-  async function pointAt(step: ActStep, disturbed: string[]): Promise<[number, number]> {
-    if (step.x !== undefined && step.y !== undefined) return [step.x, step.y];
-    let point: [number, number] | undefined;
-    let target: { client: HyprClient; active: string | null };
-    if (step.ref) {
-      // Fresh extents against the window's position now, not when the ref was minted.
-      const [{ box, pid }, clients, active] = await Promise.all([ax().extents(step.ref), hypr.clients(), hypr.activeAddress()]);
-      const owners = clients.filter((client) => client.pid === pid);
-      const client = step.window ? resolveWindow(clients, active, step.window) : owners.find((owner) => owner.address === active) ?? owners[0];
-      if (!client) throw new DesktopError("not_found", `${step.ref} belongs to no open window; look with ui again.`);
-      target = { client, active };
-      point = box && centerOf({ box: [box[0] + client.at[0], box[1] + client.at[1], box[2], box[3]] });
-    } else {
-      const found = await named(step);
-      target = found;
-      point = centerOf(found.element);
-    }
-    if (!point) throw new DesktopError("unavailable", `${step.ref ?? step.name} reports no position; use perform, or click by x and y from an image.`);
-    await focus(target.client, target.active, disturbed);
-    return point;
+  /**
+   * A step's control by ref or name, with the window that owns it and its
+   * screen box now: a ref's extents are read fresh against the window's
+   * current position, not where it was when the ref was minted.
+   */
+  async function locate(step: ActStep): Promise<Located> {
+    if (!step.ref) return named(step);
+    const [{ box, pid }, clients, active] = await Promise.all([ax().extents(step.ref), hypr.clients(), hypr.activeAddress()]);
+    const owners = clients.filter((client) => client.pid === pid);
+    const client = step.window ? resolveWindow(clients, active, step.window) : owners.find((owner) => owner.address === active) ?? owners[0];
+    if (!client) throw new DesktopError("not_found", `${step.ref} belongs to no open window; look with ui again.`);
+    return { ref: step.ref, client, active, box: box && [box[0] + client.at[0], box[1] + client.at[1], box[2], box[3]] };
   }
+
+  const refOf = async (step: ActStep) => step.ref ?? (await named(step)).ref;
 
   const moveCursor = (x: number, y: number) => hypr.dispatch({ kind: "cursor", x, y });
 
@@ -305,7 +307,16 @@ export function createDesktop(deps: DesktopDeps) {
     const report = (did: string, extra: Partial<StepReport> = {}): StepReport => ({ do: step.do, did, disturbed, ...extra });
     switch (step.do) {
       case "click": {
-        const [x, y] = await pointAt(step, disturbed);
+        let x = step.x;
+        let y = step.y;
+        if (x === undefined || y === undefined) {
+          const found = await locate(step);
+          const point = centerOf(found);
+          if (!point) throw new DesktopError("unavailable", `${found.ref} reports no position; use perform, or click by x and y from an image.`);
+          [x, y] = point;
+          // A pointer click lands on whatever is on top, so the window has to be.
+          await focus(found.client, found.active, disturbed);
+        }
         disturbed.push("pointer");
         await moveCursor(x, y);
         await sleep(20);
@@ -330,8 +341,12 @@ export function createDesktop(deps: DesktopDeps) {
       }
       case "type": {
         if (step.text === undefined) throw new DesktopError("invalid", "type needs text.");
-        if (step.ref || step.name) await ax().focus(await refOf(step));
-        if (step.window !== undefined) {
+        // The window first, then the field inside it: keystrokes go to the focused window.
+        if (step.ref || step.name) {
+          const found = await locate(step);
+          await focus(found.client, found.active, disturbed);
+          await ax().focus(found.ref);
+        } else if (step.window !== undefined) {
           const { client, active } = await window(step.window);
           await focus(client, active, disturbed);
         }
@@ -348,8 +363,9 @@ export function createDesktop(deps: DesktopDeps) {
           await hypr.dispatch({ kind: "shortcut", mods: chord.mods.join(" "), key: chord.keysym, address: client.address });
           return report(`sent ${step.keys} to ${client.class}`);
         } catch (error) {
-          // Hyprland names keys from the last keyboard's keymap; after a type that is wtype's.
-          if (!(error instanceof DesktopError && "refused" in error.details)) throw error;
+          // Hyprland names keys from the last keyboard's keymap; after a type that is wtype's,
+          // so it may not know this key. Any other refusal is the step's failure.
+          if (!(error instanceof DesktopError && /key not found|keysym/i.test(String(error.details.refused ?? "")))) throw error;
           await focus(client, active, disturbed);
           const mods = chord.mods.map((mod) => WTYPE_MODS[mod]);
           await runChecked(run, ["wtype", ...mods.flatMap((mod) => ["-M", mod]), "-k", chord.keysym, ...mods.flatMap((mod) => ["-m", mod])]);

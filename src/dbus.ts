@@ -19,7 +19,7 @@ export function variant(signature: string, value: DBusValue): Variant {
   return { signature, value };
 }
 
-function isVariant(value: unknown): value is Variant {
+export function isVariant(value: unknown): value is Variant {
   return typeof value === "object" && value !== null && !Array.isArray(value) && "signature" in value && "value" in value;
 }
 
@@ -357,7 +357,7 @@ export function socketPathOf(address: string): string {
   throw new DesktopError("unavailable", `No usable unix socket in the D-Bus address ${JSON.stringify(address)}.`);
 }
 
-export function sessionBusAddress(env: NodeJS.ProcessEnv = process.env): string {
+export function sessionBusAddress(env: NodeJS.ProcessEnv): string {
   return env.DBUS_SESSION_BUS_ADDRESS || `unix:path=${runtimeDir(env)}/bus`;
 }
 

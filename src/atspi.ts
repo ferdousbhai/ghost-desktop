@@ -4,7 +4,7 @@
  * screen coordinates: AT-SPI's window-relative extents plus the window's
  * Hyprland position, because Wayland clients cannot report screen positions.
  */
-import { DBusConnection, DBusError, sessionBusAddress, variant, type DBusValue, type Variant } from "./dbus.js";
+import { DBusConnection, DBusError, isVariant, sessionBusAddress, variant, type DBusValue } from "./dbus.js";
 import { DesktopError } from "./errors.js";
 
 export interface AxWindow {
@@ -29,7 +29,10 @@ export interface AxElement {
 
 export interface AxQuery {
   role?: string;
+  /** Name, text, or value contains this. */
   text?: string;
+  /** Name contains this, exact names first; reads no text. */
+  name?: string;
   actionable?: boolean;
   limit: number;
 }
@@ -52,7 +55,7 @@ export interface Atspi {
 }
 
 /** The rounded center of an element's box, where a pointer click lands. */
-export function centerOf(element: Pick<AxElement, "box">): [number, number] | undefined {
+export function centerOf(element: { box?: AxElement["box"] | undefined }): [number, number] | undefined {
   if (!element.box) return undefined;
   const [x, y, width, height] = element.box;
   return [Math.round(x + width / 2), Math.round(y + height / 2)];
@@ -125,8 +128,14 @@ function stateNames(words: DBusValue): string[] {
   return names;
 }
 
-function unwrap(value: DBusValue | undefined): DBusValue {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Variant).value : (value as DBusValue);
+function unwrap(value: DBusValue): DBusValue {
+  return isVariant(value) ? value.value : value;
+}
+
+/** AT-SPI extents as a box offset by `at`; a zero-size element has none. */
+function boxOf(extents: DBusValue, at: readonly [number, number]): [number, number, number, number] | undefined {
+  const [x, y, width, height] = (extents as number[]).map(Number) as [number, number, number, number];
+  return width > 0 || height > 0 ? [x + at[0], y + at[1], width, height] : undefined;
 }
 
 interface Target {
@@ -151,7 +160,7 @@ function flatten(roots: Node[]): Node[] {
   return out;
 }
 
-export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
+export function createAtspi(env: NodeJS.ProcessEnv): Atspi {
   let connecting: Promise<DBusConnection> | null = null;
   // A connection's PID per unique bus name; unique names are never reused, so
   // it holds for the life of the connection and is dropped with it.
@@ -198,7 +207,7 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
     return connecting;
   }
 
-  async function call(conn: DBusConnection, target: { bus: string; path: string }, iface: string, member: string, signature = "", body: DBusValue[] = []): Promise<DBusValue[]> {
+  async function call(conn: DBusConnection, target: Target, iface: string, member: string, signature = "", body: DBusValue[] = []): Promise<DBusValue[]> {
     if (inFlight >= MAX_IN_FLIGHT) await new Promise<void>((resolve) => waiting.push(resolve));
     inFlight++;
     try {
@@ -214,14 +223,16 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
     return (list as DBusValue[][]).map((entry) => String(entry[0]));
   }
 
-  async function text(conn: DBusConnection, target: Target): Promise<string> {
-    const [value] = await call(conn, target, TEXT, "GetText", "ii", [0, MAX_TEXT]);
-    return String(value);
+  /** Set an element's text, unless it is empty or just repeats the name. */
+  async function attachText(conn: DBusConnection, target: Target, element: Omit<AxElement, "ref">): Promise<void> {
+    const [value] = await call(conn, target, TEXT, "GetText", "ii", [0, MAX_TEXT]).catch(() => [""]);
+    const text = String(value);
+    if (text && text !== element.name) element.text = text;
   }
 
-  async function property(conn: DBusConnection, target: { bus: string; path: string }, iface: string, name: string): Promise<DBusValue> {
+  async function property(conn: DBusConnection, target: Target, iface: string, name: string): Promise<DBusValue> {
     const [value] = await call(conn, target, PROPERTIES, "Get", "ss", [iface, name]);
-    return unwrap(value);
+    return unwrap(value as DBusValue);
   }
 
   function mint(target: Target): string {
@@ -267,10 +278,8 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
     const roleName = String(role);
     const states = stateNames(state as DBusValue);
     const element: Omit<AxElement, "ref"> = { role: roleName, name: String(name ?? ""), states, actions: [] };
-    if (extents) {
-      const [x, y, width, height] = extents.map(Number) as [number, number, number, number];
-      if (width > 0 || height > 0) element.box = [x + at[0], y + at[1], width, height];
-    }
+    const box = extents && boxOf(extents, at);
+    if (box) element.box = box;
     const extras: Promise<unknown>[] = [];
     if (has.has(ACTION)) {
       extras.push(actionNames(conn, target).then((names) => {
@@ -283,11 +292,7 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
       }, () => undefined));
     }
     const hasText = has.has(TEXT) && roleName !== "password text";
-    if (hasText && withText) {
-      extras.push(text(conn, target).then((value) => {
-        if (value && value !== element.name) element.text = value;
-      }, () => undefined));
-    }
+    if (hasText && withText) extras.push(attachText(conn, target, element));
     await Promise.all(extras);
     // GTK4 reports a toggle's on state as `pressed`, not `checked`.
     if (CHECKABLE_ROLES.has(roleName) || states.includes("checkable")) element.checked = states.includes("checked") || states.includes("pressed");
@@ -367,6 +372,7 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
       const role = query.role.toLowerCase();
       if (!element.role.toLowerCase().includes(role)) return false;
     }
+    if (query.name && !element.name.toLowerCase().includes(query.name.toLowerCase())) return false;
     if (query.text) {
       const needle = query.text.toLowerCase();
       const hay = [element.name, element.text ?? "", element.value === undefined ? "" : String(element.value)];
@@ -409,12 +415,11 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
       const roles: Record<string, number> = {};
       for (const node of nodes) roles[node.element.role] = (roles[node.element.role] ?? 0) + 1;
       const matched = nodes.filter((node) => node.depth > 0 || nodes.length === 1).filter((node) => matches(node, query));
+      // A name lookup puts exact names first, so a limit never cuts the control it means.
+      const exact = query.name?.toLowerCase();
+      if (exact) matched.sort((a, b) => Number(b.element.name.toLowerCase() === exact) - Number(a.element.name.toLowerCase() === exact));
       const shown = matched.slice(0, query.limit);
-      if (!query.text) {
-        await Promise.all(shown.filter((node) => node.hasText).map((node) => text(conn, node).then((value) => {
-          if (value && value !== node.element.name) node.element.text = value;
-        }, () => undefined)));
-      }
+      if (!query.text) await Promise.all(shown.filter((node) => node.hasText).map((node) => attachText(conn, node, node.element)));
       return { elements: shown.map((node) => ({ ref: mint(node), ...node.element })), total: matched.length, roles };
     },
 
@@ -448,8 +453,8 @@ export function createAtspi(env: NodeJS.ProcessEnv = process.env): Atspi {
 
     extents: (ref) => withTarget(ref, "click by x and y from an image instead", async (conn, target) => {
       const [[extents], pid] = await Promise.all([call(conn, target, COMPONENT, "GetExtents", "u", [COORD_WINDOW]), pidOf(conn, target.bus)]);
-      const [x, y, width, height] = (extents as number[]).map(Number) as [number, number, number, number];
-      return { pid, ...(width > 0 || height > 0 ? { box: [x, y, width, height] as [number, number, number, number] } : {}) };
+      const box = boxOf(extents as DBusValue, [0, 0]);
+      return { pid, ...(box ? { box } : {}) };
     }),
 
     async close() {

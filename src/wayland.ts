@@ -13,7 +13,8 @@ import { join } from "node:path";
 import { DesktopError } from "./errors.js";
 import { ByteQueue, connectUnix, runtimeDir } from "./session.js";
 
-export type MouseButton = "left" | "right" | "middle";
+export const MOUSE_BUTTONS = ["left", "right", "middle"] as const;
+export type MouseButton = (typeof MOUSE_BUTTONS)[number];
 
 export interface VirtualPointer {
   button(button: MouseButton, pressed: boolean): Promise<void>;
@@ -214,7 +215,7 @@ class Connection {
 }
 
 /** Connect to the session's compositor and create one virtual pointer device. */
-export async function openVirtualPointer(env: NodeJS.ProcessEnv = process.env): Promise<VirtualPointer> {
+export async function openVirtualPointer(env: NodeJS.ProcessEnv): Promise<VirtualPointer> {
   const wire = new Connection(await connectUnix(socketPath(env), "The Wayland display"));
   try {
     wire.registry = wire.newId();

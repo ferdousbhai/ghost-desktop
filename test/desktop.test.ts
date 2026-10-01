@@ -24,7 +24,7 @@ function element(ref: string, name: string, over: Partial<AxElement> = {}): AxEl
   return { ref, role: "button", name, states: ["sensitive", "showing"], actions: ["click"], box: [10, 310, 20, 20], ...over };
 }
 
-function harness(options: { locked?: boolean | null; elements?: AxElement[]; shortcutFails?: boolean; opens?: string } = {}) {
+function harness(options: { locked?: boolean | null; elements?: AxElement[]; shortcutRefused?: string; opens?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ghost-desktop-"));
   dirs.push(dir);
   const dispatched: Intent[] = [];
@@ -40,7 +40,7 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
     cursor: async () => [0, 0],
     locked: async () => (options.locked === undefined ? false : options.locked),
     dispatch: async (intent) => {
-      if (intent.kind === "shortcut" && options.shortcutFails) throw new DesktopError("failed", "key not found", { refused: "send_shortcut: key not found" });
+      if (intent.kind === "shortcut" && options.shortcutRefused) throw new DesktopError("failed", options.shortcutRefused, { refused: options.shortcutRefused });
       dispatched.push(intent);
       if (intent.kind === "focus") active = intent.address;
     },
@@ -107,10 +107,14 @@ describe("desktop_act", () => {
     const done = await quiet.desktop.act({ steps: [{ do: "key", keys: "ctrl+s", window: "org.gnome.Nautilus" }] }, "a");
     expect(quiet.dispatched).toEqual([{ kind: "shortcut", mods: "CTRL", key: "s", address: "0xb" }]);
     expect(done.steps[0]!.disturbed).toEqual([]);
-    const loud = harness({ shortcutFails: true });
+    const loud = harness({ shortcutRefused: "send_shortcut: key not found" });
     const fallback = await loud.desktop.act({ steps: [{ do: "key", keys: "ctrl+s", window: "org.gnome.Nautilus" }] }, "a");
     expect(loud.commands.at(-1)).toEqual(["wtype", "-M", "ctrl", "-k", "s", "-m", "ctrl"]);
     expect(fallback.steps[0]!.disturbed).toEqual(["focus"]);
+    const refused = harness({ shortcutRefused: "send_shortcut: window not found" });
+    const failed = await refused.desktop.act({ steps: [{ do: "key", keys: "ctrl+s", window: "org.gnome.Nautilus" }] }, "a");
+    expect(failed.failed?.error.message).toContain("window not found");
+    expect(refused.commands).toEqual([]);
   });
 
   it("clicks a named control at its center with the real pointer, focusing its window first", async () => {

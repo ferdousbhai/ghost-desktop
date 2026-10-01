@@ -182,7 +182,7 @@ export function socketRequest(env: NodeJS.ProcessEnv): HyprRequest {
  * `user/self`'s Display session, which also holds for a process a systemd
  * user unit started outside any session. Null when logind cannot say.
  */
-export async function logindLocked(env: NodeJS.ProcessEnv): Promise<boolean | null> {
+async function logindLocked(env: NodeJS.ProcessEnv): Promise<boolean | null> {
   let conn: DBusConnection | undefined;
   try {
     conn = await DBusConnection.connect(env.DBUS_SYSTEM_BUS_ADDRESS || "unix:path=/run/dbus/system_bus_socket", { timeoutMs: 2000 });
@@ -202,8 +202,8 @@ export async function logindLocked(env: NodeJS.ProcessEnv): Promise<boolean | nu
   }
 }
 
-export function createHypr(options: { env?: NodeJS.ProcessEnv; request?: HyprRequest; logind?: () => Promise<boolean | null> } = {}): Hypr {
-  const env = options.env ?? process.env;
+export function createHypr(options: { env: NodeJS.ProcessEnv; request?: HyprRequest; logind?: () => Promise<boolean | null> }): Hypr {
+  const { env } = options;
   const request = options.request ?? socketRequest(env);
   const logind = options.logind ?? (() => logindLocked(env));
   let lua: boolean | undefined;

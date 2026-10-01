@@ -125,6 +125,15 @@ describe("query", () => {
     expect(capped.total).toBe(4);
   });
 
+  it("looks up a name without reading text, exact names first", async () => {
+    // "Query" is only the text field's name; "hello" is its text, which a name lookup never matches.
+    expect((await atspi.query(WINDOW, { name: "hello", limit: 5 })).elements).toEqual([]);
+    nodes["/t1"]!.name = "Search field";
+    const found = await atspi.query(WINDOW, { name: "search", limit: 1 });
+    expect(found.elements.map((e) => e.name)).toEqual(["Search"]);
+    expect(found.total).toBe(2);
+  });
+
   it("walks every frame when the title matches none", async () => {
     const result = await atspi.query({ ...WINDOW, title: "nothing like it" }, { role: "push button", limit: 10 });
     expect(result.elements.map((e) => e.name)).toEqual(["Search", "Other button"]);

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { ACT_VERBS, BOUNDS, MAX_STEPS, type ActArgs, type Desktop, type LookArgs, type Observation } from "./desktop.js";
+import { ACT_VERBS, BOUNDS, MAX_STEPS, THEN_LOOKS, WAIT_EVENTS, type ActArgs, type Desktop, type LookArgs, type Observation } from "./desktop.js";
 import { DesktopError } from "./errors.js";
+import { MOUSE_BUTTONS } from "./wayland.js";
 
 export const LOOK = "desktop_look";
 export const ACT = "desktop_act";
@@ -77,7 +78,7 @@ export const TOOLS = [
               y: num("Screen y."),
               to_x: num("drag: release x."),
               to_y: num("drag: release y."),
-              button: { type: "string", enum: ["left", "right", "middle"] },
+              button: { type: "string", enum: [...MOUSE_BUTTONS] },
               clicks: int("click: 2 is a double click.", BOUNDS.clicks),
               text: str("type, notify, copy: the text."),
               keys: str("key: the chord."),
@@ -87,7 +88,7 @@ export const TOOLS = [
               dx: num("scroll: horizontal notches, positive right."),
               workspace: str("workspace, send, launch: 3, +1, or name:web."),
               command: str("launch: the command line."),
-              event: { type: "string", enum: ["open", "close", "title", "workspace"] },
+              event: { type: "string", enum: [...WAIT_EVENTS] },
               match: str("wait: the event's data contains this (class, title, workspace)."),
               timeout_ms: int(`wait, launch: how long, default ${BOUNDS.wait_ms[2]} / ${BOUNDS.launch_ms[2]}.`, BOUNDS.wait_ms),
               title: str("notify: the title."),
@@ -97,7 +98,7 @@ export const TOOLS = [
           },
         },
         // biome-ignore lint/suspicious/noThenProperty: desktop_act's `then` argument, a JSON Schema property name, not a thenable.
-        then: { type: "string", enum: ["none", "desktop", "ui", "image"], description: "Look after the steps; default none." },
+        then: { type: "string", enum: [...THEN_LOOKS], description: "Look after the steps; default none." },
       },
       required: ["steps"],
       additionalProperties: false,

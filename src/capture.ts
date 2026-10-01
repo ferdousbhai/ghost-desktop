@@ -1,6 +1,6 @@
 import { DesktopError } from "./errors.js";
 import { logicalSize, windowShown, type HyprClient, type HyprMonitor } from "./hypr.js";
-import { runChecked, runCommand, type Runner } from "./run.js";
+import { runChecked, type Runner } from "./run.js";
 
 export interface Shot {
   readonly data: Uint8Array;
@@ -40,7 +40,7 @@ export function imageSize(data: Uint8Array): [number, number] {
   throw new DesktopError("failed", "grim returned an image whose size could not be read.");
 }
 
-export function createCapture(run: Runner = runCommand) {
+export function createCapture(run: Runner) {
   const grim = async (
     args: string[],
     options: CaptureOptions,
