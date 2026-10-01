@@ -24,8 +24,7 @@ export class DesktopLease {
   private readonly file: string;
   private readonly mutex: string;
 
-  constructor(dir: string, private readonly now: () => number = Date.now) {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  constructor(private readonly dir: string, private readonly now: () => number = Date.now) {
     this.file = join(dir, "lease.json");
     this.mutex = join(dir, "lease.lock");
   }
@@ -69,6 +68,7 @@ export class DesktopLease {
   // An exclusive-create file is the cross-process mutex; one left by a crashed
   // process is broken after MUTEX_STALE_MS, far longer than any claim takes.
   private async locked<T>(body: () => T): Promise<T> {
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const deadline = this.now() + MUTEX_STALE_MS * 2;
     for (;;) {
       try {

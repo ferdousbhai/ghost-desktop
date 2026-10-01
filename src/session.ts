@@ -1,5 +1,32 @@
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { connect, type Socket } from "node:net";
+import { join } from "node:path";
 import { DesktopError } from "./errors.js";
+
+/**
+ * The session variables a host may not pass on (the MCP SDK's default child
+ * environment drops them), filled in from where the session keeps them: the
+ * user's runtime directory, and the newest Hyprland instance in it with its
+ * Wayland display. A value the host did pass always wins.
+ */
+export function sessionEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const runtime = env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 0}`;
+  const filled: Record<string, string> = { XDG_RUNTIME_DIR: runtime };
+  const hyprDir = join(runtime, "hypr");
+  const signature = env.HYPRLAND_INSTANCE_SIGNATURE || (existsSync(hyprDir)
+    ? readdirSync(hyprDir)
+      .filter((name) => existsSync(join(hyprDir, name, ".socket.sock")))
+      .sort((a, b) => statSync(join(hyprDir, b)).mtimeMs - statSync(join(hyprDir, a)).mtimeMs)[0]
+    : undefined);
+  if (signature) filled.HYPRLAND_INSTANCE_SIGNATURE = signature;
+  if (!env.WAYLAND_DISPLAY && signature) {
+    // hyprland.lock holds the compositor's pid, then its Wayland display.
+    const lock = join(hyprDir, signature, "hyprland.lock");
+    const display = existsSync(lock) ? readFileSync(lock, "utf8").split("\n")[1]?.trim() : undefined;
+    if (display) filled.WAYLAND_DISPLAY = display;
+  }
+  return filled;
+}
 
 /** The graphical session's runtime directory, where every desktop socket lives. */
 export function runtimeDir(env: NodeJS.ProcessEnv): string {
