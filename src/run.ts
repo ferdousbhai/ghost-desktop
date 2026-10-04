@@ -12,12 +12,6 @@ export interface RunOptions {
   readonly timeoutMs?: number;
   /** Return raw stdout bytes (images) instead of text. */
   readonly binary?: boolean;
-  /**
-   * Leave stdout and stderr unread. For commands that fork a helper which
-   * outlives them (wl-copy keeps serving the clipboard), whose inherited pipe
-   * would otherwise never close.
-   */
-  readonly detached?: boolean;
 }
 
 /** Runs one external command without a shell; a missing binary is `unavailable`. */
@@ -26,17 +20,12 @@ export type Runner = (argv: readonly string[], options?: RunOptions) => Promise<
 export const runCommand: Runner = async (argv, options = {}) => {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn([...argv], {
-      stdin: "ignore",
-      stdout: options.detached ? "ignore" : "pipe",
-      stderr: options.detached ? "ignore" : "pipe",
-    });
+    proc = Bun.spawn([...argv], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   } catch {
     throw new DesktopError("unavailable", `${argv[0]} is not installed.`, { binary: argv[0] });
   }
   const timer = setTimeout(() => proc.kill(), options.timeoutMs ?? 10_000);
   try {
-    if (options.detached) return { code: await proc.exited, stdout: "", stderr: "" };
     const [out, stderr, code] = await Promise.all([
       new Response(proc.stdout as ReadableStream).arrayBuffer(),
       new Response(proc.stderr as ReadableStream).text(),

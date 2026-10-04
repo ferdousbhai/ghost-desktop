@@ -41,14 +41,13 @@ function fakeHyprland(answer: (command: string) => string) {
 describe("dispatch encoding", () => {
   it("escapes every value into a Lua literal, never raw code", () => {
     expect(luaString('a"b\\c\n')).toBe('"a\\034b\\092c\\010"');
-    expect(encodeIntent({ kind: "exec", command: 'x"); os.exit(' }, true)).toBe('hl.dsp.exec_cmd("x\\034); os.exit(")');
+    expect(encodeIntent({ kind: "focus", address: 'x"); os.exit(' }, true)).toBe('hl.dsp.focus({ window = "address:x\\034); os.exit(" })');
   });
 
   it("speaks both grammars for each intent", () => {
     expect(encodeIntent({ kind: "focus", address: "0xa" }, true)).toBe('hl.dsp.focus({ window = "address:0xa" })');
     expect(encodeIntent({ kind: "focus", address: "0xa" }, false)).toBe("focuswindow address:0xa");
-    expect(encodeIntent({ kind: "workspace", workspace: "3" }, true)).toBe("hl.dsp.focus({ workspace = 3 })");
-    expect(encodeIntent({ kind: "move", address: "0xa", workspace: "2" }, true)).toContain("follow = false");
+    expect(encodeIntent({ kind: "cursor", x: 1.4, y: 2 }, true)).toBe("hl.dsp.cursor.move({ x = 1, y = 2 })");
     expect(encodeIntent({ kind: "shortcut", mods: "CTRL", key: "s", address: "0xa" }, false)).toBe("sendshortcut CTRL,s,address:0xa");
   });
 });
@@ -65,19 +64,19 @@ describe("createHypr", () => {
         return command === "j/status" ? '{"configProvider":"lua"}' : "ok";
       },
     });
-    await expect(hypr.dispatch({ kind: "workspace", workspace: "2" })).rejects.toThrow("socket down");
+    await expect(hypr.dispatch({ kind: "cursor", x: 2, y: 0 })).rejects.toThrow("socket down");
     up = true;
-    await hypr.dispatch({ kind: "workspace", workspace: "2" });
-    expect(sent.at(-1)).toBe("dispatch hl.dsp.focus({ workspace = 2 })");
+    await hypr.dispatch({ kind: "cursor", x: 2, y: 0 });
+    expect(sent.at(-1)).toBe("dispatch hl.dsp.cursor.move({ x = 2, y = 0 })");
   });
 
   it("talks to Hyprland's own socket, and picks the grammar from the config provider once", async () => {
     const hyprland = fakeHyprland((command) => (command === "j/status" ? '{"configProvider":"lua"}' : command === "j/clients" ? "[]" : "ok"));
     const hypr = createHypr({ env: hyprland.env });
     expect(await hypr.clients()).toEqual([]);
-    await hypr.dispatch({ kind: "workspace", workspace: "2" });
-    await hypr.dispatch({ kind: "workspace", workspace: "3" });
-    expect(hyprland.requests).toEqual(["j/clients", "j/status", "dispatch hl.dsp.focus({ workspace = 2 })", "dispatch hl.dsp.focus({ workspace = 3 })"]);
+    await hypr.dispatch({ kind: "cursor", x: 2, y: 0 });
+    await hypr.dispatch({ kind: "cursor", x: 3, y: 0 });
+    expect(hyprland.requests).toEqual(["j/clients", "j/status", "dispatch hl.dsp.cursor.move({ x = 2, y = 0 })", "dispatch hl.dsp.cursor.move({ x = 3, y = 0 })"]);
   });
 
   it("treats a refusal as failure and an unknown lock state as unknown", async () => {
@@ -87,18 +86,15 @@ describe("createHypr", () => {
     expect(await createHypr({ env: {}, logind: async () => true, request: async () => "false" }).locked()).toBe(true);
   });
 
-  it("waits for a matching event that its own action causes", async () => {
+  it("waits for a matching event", async () => {
     const hyprland = fakeHyprland(() => "ok");
     const hypr = createHypr({ env: hyprland.env, request: async () => "ok" });
-    const seen = await hypr.waitEvent(["openwindow"], {
-      timeoutMs: 2000,
-      match: "foot",
-      after: async () => {
-        await Bun.sleep(20);
-        hyprland.emit("openwindow>>dead,1,firefox,Docs");
-        hyprland.emit("openwindow>>beef,2,foot,foot");
-      },
-    });
+    // Emitted until the listener has connected and taken one.
+    const ticker = setInterval(() => {
+      hyprland.emit("openwindow>>dead,1,firefox,Docs");
+      hyprland.emit("openwindow>>beef,2,foot,foot");
+    }, 20);
+    const seen = await hypr.waitEvent(["openwindow"], { timeoutMs: 2000, match: "foot" }).finally(() => clearInterval(ticker));
     expect(seen).toEqual({ name: "openwindow", data: "beef,2,foot,foot" });
     expect(await hypr.waitEvent(["closewindow"], { timeoutMs: 50 })).toBeNull();
   });

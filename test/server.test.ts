@@ -22,7 +22,7 @@ describe("ghost-desktop MCP server", () => {
       act: async (_args: unknown, caller: string) => {
         callers.push(caller);
         return {
-          steps: [{ do: "focus", did: "focused foot", disturbed: ["focus"] }],
+          steps: [{ do: "key", did: "sent Return to foot", disturbed: [] }],
           failed: { index: 1, error: new DesktopError("busy", "Another agent (x) is steering the desktop.") },
         };
       },
@@ -34,7 +34,7 @@ describe("ghost-desktop MCP server", () => {
     await client.connect(clientSide);
     const look = await client.callTool({ name: LOOK, arguments: {} });
     expect(look.content).toEqual([{ type: "text", text: '{"windows":[]}' }, { type: "image", data: "AQ==", mimeType: "image/png" }]);
-    const act = await client.callTool({ name: ACT, arguments: { steps: [{ do: "focus" }] }, _meta: { caller: "ghost dous/conv-1" } });
+    const act = await client.callTool({ name: ACT, arguments: { steps: [{ do: "key", keys: "Return" }] }, _meta: { caller: "ghost dous/conv-1" } });
     expect(act.isError).toBe(true);
     expect((act.content as Array<{ text: string }>)[0]!.text).toContain('"failedStep":1');
     expect((act.content as Array<{ text: string }>)[0]!.text).toContain("busy: Another agent");

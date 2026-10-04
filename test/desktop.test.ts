@@ -44,10 +44,7 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
       dispatched.push(intent);
       if (intent.kind === "focus") active = intent.address;
     },
-    waitEvent: async (_names, { after }) => {
-      await after?.();
-      return options.opens ? { name: "openwindow", data: options.opens } : null;
-    },
+    waitEvent: async () => (options.opens ? { name: "openwindow", data: options.opens } : null),
   };
   const elements = options.elements ?? [element("e1", "Search"), element("e2", "Close")];
   const known = (ref: string) => {
@@ -148,11 +145,10 @@ describe("desktop_act", () => {
     expect(commands.at(-1)).toEqual(["wtype", "--", text]);
   });
 
-  it("launches through the window-open event and reports the new window", async () => {
-    const { desktop, dispatched } = harness({ opens: "b,1,org.gnome.Nautilus,data" });
-    const result = await desktop.act({ steps: [{ do: "launch", command: "nautilus", workspace: "2" }] }, "a");
-    expect(dispatched).toEqual([{ kind: "exec", command: "[workspace 2 silent] nautilus" }]);
-    expect(result.steps[0]!.window).toMatchObject({ address: "0xb", class: "org.gnome.Nautilus" });
+  it("waits for a window-open event and reports it", async () => {
+    const { desktop } = harness({ opens: "b,1,org.gnome.Nautilus,data" });
+    const result = await desktop.act({ steps: [{ do: "wait", event: "open", match: "nautilus" }] }, "a");
+    expect(result.steps[0]).toMatchObject({ did: "saw open", event: { event: "open", data: "b,1,org.gnome.Nautilus,data" } });
   });
 
   it("drags with intermediate motion and always releases", async () => {

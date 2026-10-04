@@ -2,8 +2,8 @@
 
 Computer use for [Omarchy](https://omarchy.org) and any Hyprland desktop, as a
 stdio [MCP](https://modelcontextprotocol.io) server. Two tools let an agent see
-the desktop and steer it: windows and workspaces, apps' controls through the
-accessibility tree, screenshots, the pointer, and the keyboard.
+the desktop and steer it: apps' controls through the accessibility tree,
+screenshots, the pointer, and the keyboard.
 
 It is the computer use of [Ghost](https://github.com/ferdousbhai/ghost), and
 works on its own with Claude Code, Codex, or any MCP client.
@@ -11,15 +11,15 @@ works on its own with Claude Code, Codex, or any MCP client.
 ## Install
 
 Needs [Bun](https://bun.sh) 1.3.14 or newer, Hyprland 0.56 or newer, and
-`grim`, `wtype`, `wl-clipboard`, `libnotify`, and `at-spi2-core` (Omarchy ships
-all of them).
+`grim`, `wtype`, `wl-clipboard`, and `at-spi2-core` (Omarchy ships all of
+them).
 
 ```sh
 bun install -g github:ferdousbhai/ghost-desktop
 claude mcp add --scope user desktop -- ghost-desktop
 ```
 
-Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.3`. Bun puts
+Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.4`. Bun puts
 `ghost-desktop` in `~/.bun/bin`. TypeScript throughout, run by Bun directly;
 its only package dependency is the MCP SDK.
 
@@ -34,6 +34,8 @@ which is the single source; this page covers what the schemas cannot.
   (`ui`) or a screenshot (`image`), or screenshot a region or monitor.
 - **`desktop_act`** runs ordered `steps` and stops at the first failure,
   returning what was done before it. `then` looks again in the same call.
+  Launching apps and managing windows and workspaces are not steps: run them
+  from a shell (`hyprctl dispatch`, `omarchy`), then `wait` for the window.
 
 ## Coordinates
 
@@ -46,19 +48,19 @@ A control from `ui` carries its center as `at`.
 
 | Need | How | Fails as |
 | --- | --- | --- |
-| Windows, focus, workspaces, launching, events | Hyprland's request and event sockets, dispatching in the session's grammar (Lua on 0.56+, legacy strings before); every value is a Lua string literal, never raw code | `unavailable` outside Hyprland |
+| Windows, focus, events | Hyprland's request and event sockets, dispatching in the session's grammar (Lua on 0.56+, legacy strings before); every value is a Lua string literal, never raw code | `unavailable` outside Hyprland |
 | Screenshots | `grim -T` reads a window's own buffer, covered or on another workspace; a window on screen whose buffer cannot be read falls back to the screen region and says so; a hidden one is refused | `unavailable` |
 | Controls | the AT-SPI bus, over ghost-desktop's own D-Bus client | `unavailable`, with how to start the bus or enable Chromium's tree |
 | Pointer | Hyprland moves the cursor; a `zwlr_virtual_pointer_v1` device per step clicks, drags, and scrolls, then is destroyed | `unavailable` if the compositor lacks the protocol |
 | Keys | `send_shortcut` to the named window, no focus change. Hyprland names keys from the last keyboard's keymap, which after a `type` is wtype's, so a refused chord falls back to focusing the window and `wtype` | |
 | Text | `wtype` into the focused field, the text as an argument (from stdin wtype drops characters past ~100); layout-independent | |
-| Clipboard, notifications | `wl-clipboard`, `notify-send` | `unavailable` if missing |
+| Clipboard (read) | `wl-paste` | `unavailable` if missing |
 
-Every step reports what it disturbed: `focus`, `pointer`, or `workspace`.
+Every step reports what it disturbed: `focus` or `pointer`.
 
 A key chord reaches the window, never Hyprland's own bindings: `super+shift+3`
-sent to a terminal types `#`. Workspace and window moves are `desktop_act`
-steps; anything else bound in Hyprland is an `omarchy` command.
+sent to a terminal types `#`; what is bound in Hyprland is a `hyprctl
+dispatch` or `omarchy` command.
 
 ## Safety
 

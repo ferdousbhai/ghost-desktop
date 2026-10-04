@@ -70,21 +70,11 @@ function windowSelector(address: string): string {
   return address.includes(":") ? address : `address:${address}`;
 }
 
-function workspaceValue(workspace: string): string | number {
-  return /^-?\d+$/.test(workspace) ? Number(workspace) : workspace;
-}
-
 // The Lua dispatch encoding is ported from hypruse (MIT, Ilyas Khallouki).
 
 /** A desktop intent in both dispatch grammars: Lua (0.56+) and the legacy strings. */
 export type Intent =
   | { kind: "focus"; address: string }
-  | { kind: "workspace"; workspace: string }
-  | { kind: "move"; address: string; workspace: string }
-  | { kind: "close"; address: string }
-  | { kind: "fullscreen"; address: string }
-  | { kind: "float"; address: string }
-  | { kind: "exec"; command: string }
   | { kind: "cursor"; x: number; y: number }
   | { kind: "shortcut"; mods: string; key: string; address: string };
 
@@ -96,27 +86,6 @@ export function encodeIntent(intent: Intent, lua: boolean): string {
       const window = windowSelector(intent.address);
       return lua ? call("focus", { window }) : `focuswindow ${window}`;
     }
-    case "workspace":
-      return lua ? call("focus", { workspace: workspaceValue(intent.workspace) }) : `workspace ${intent.workspace}`;
-    case "move": {
-      const window = windowSelector(intent.address);
-      // follow = false is the silent move; anything else drags the owner's view along.
-      return lua
-        ? call("window.move", { workspace: workspaceValue(intent.workspace), window, follow: false })
-        : `movetoworkspacesilent ${intent.workspace},${window}`;
-    }
-    case "close": {
-      const window = windowSelector(intent.address);
-      return lua ? call("window.close", { window }) : `closewindow ${window}`;
-    }
-    case "fullscreen":
-      return lua ? call("window.fullscreen", { mode: "fullscreen", action: "toggle", window: windowSelector(intent.address) }) : "fullscreen 0";
-    case "float": {
-      const window = windowSelector(intent.address);
-      return lua ? call("window.float", { action: "toggle", window }) : `togglefloating ${window}`;
-    }
-    case "exec":
-      return lua ? `hl.dsp.exec_cmd(${luaString(intent.command)})` : `exec ${intent.command}`;
     case "cursor": {
       const [x, y] = [Math.round(intent.x), Math.round(intent.y)];
       return lua ? call("cursor.move", { x, y }) : `movecursor ${x} ${y}`;
@@ -142,12 +111,8 @@ export interface Hypr {
   /** True locked, false unlocked, null when nothing could tell. */
   locked(): Promise<boolean | null>;
   dispatch(intent: Intent): Promise<void>;
-  /**
-   * The first event named in `names` whose data contains `match`, or null at
-   * the timeout. `after` runs once the listener is connected, so an event it
-   * causes cannot be missed.
-   */
-  waitEvent(names: readonly string[], options: { match?: string; timeoutMs: number; after?: () => Promise<void> }): Promise<HyprEvent | null>;
+  /** The first event named in `names` whose data contains `match`, or null at the timeout. */
+  waitEvent(names: readonly string[], options: { match?: string; timeoutMs: number }): Promise<HyprEvent | null>;
 }
 
 /** Sends one request on Hyprland's request socket and returns the whole reply. */
@@ -259,10 +224,10 @@ export function createHypr(options: { env: NodeJS.ProcessEnv; request?: HyprRequ
       const reply = (await request(`dispatch ${encodeIntent(intent, await provider())}`)).trim();
       if (reply !== "ok") throw new DesktopError("failed", `Hyprland refused ${intent.kind}: ${reply.slice(0, 200)}`, { refused: reply });
     },
-    async waitEvent(names, { match, timeoutMs, after }) {
+    async waitEvent(names, { match, timeoutMs }) {
       const socket: Socket = await connectUnix(join(socketDir(env), ".socket2.sock"), "Hyprland's event socket");
       const folded = match?.toLowerCase();
-      const seen = new Promise<HyprEvent | null>((resolve) => {
+      return new Promise<HyprEvent | null>((resolve) => {
         let buffer = "";
         const finish = (event: HyprEvent | null) => {
           clearTimeout(timer);
@@ -281,13 +246,6 @@ export function createHypr(options: { env: NodeJS.ProcessEnv; request?: HyprRequ
           }
         });
       });
-      try {
-        await after?.();
-      } catch (error) {
-        socket.destroy();
-        throw error;
-      }
-      return seen;
     },
   };
 }

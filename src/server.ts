@@ -51,16 +51,15 @@ export const TOOLS = [
   {
     name: ACT,
     description:
-      "Steer the desktop: steps run in order and stop at the first failure; each reports what it disturbed (focus, pointer, "
-      + "workspace). Prefer acting through controls: perform (a control's own action, works on covered windows) and set "
+      "Steer the desktop: steps run in order and stop at the first failure; each reports what it disturbed (focus, "
+      + "pointer). Prefer acting through controls: perform (a control's own action, works on covered windows) and set "
       + "(replace text, set a number, or focus when value is omitted) by ref or name. click: a ref, name, or x,y with the "
       + "real pointer (button, clicks 1-3); the window is focused first. type: text into the focused field, or into ref/name, "
       + "or window. key: a chord such as ctrl+s or Return, delivered to window without moving focus. drag: x,y to to_x,to_y. "
-      + "scroll: dy notches (positive is down), dx, optionally at x,y. move: park the pointer. focus, workspace, send (window "
-      + "to workspace, silently), close, fullscreen, float: window management. launch: run command, optionally on workspace, "
-      + "and return its window. wait: for event open, close, title, or workspace whose data contains match. notify: a desktop "
-      + "notification. copy: text to the clipboard. then: look again after the last step (desktop, ui, or image of the last "
-      + "window). Refused while the screen is locked, or while another agent holds the desktop.",
+      + "scroll: dy notches (positive is down), dx, optionally at x,y. move: park the pointer. wait: for event open, close, "
+      + "title, or workspace whose data contains match. then: look again after the last step (desktop, ui, or image of the "
+      + "last window). Launching apps and window management go through Bash (hyprctl dispatch, omarchy). Refused while the "
+      + "screen is locked, or while another agent holds the desktop.",
     inputSchema: {
       type: "object",
       properties: {
@@ -81,18 +80,15 @@ export const TOOLS = [
               to_y: num("drag: release y."),
               button: { type: "string", enum: [...MOUSE_BUTTONS] },
               clicks: int("click: 2 is a double click.", BOUNDS.clicks),
-              text: str("type, notify, copy: the text."),
+              text: str("type: the text."),
               keys: str("key: the chord."),
               value: { type: ["string", "number"], description: "set: new text or number; omit to focus the control." },
               action: str("perform: an action name from the control's actions; default its first."),
               dy: num("scroll: vertical notches, positive down."),
               dx: num("scroll: horizontal notches, positive right."),
-              workspace: str("workspace, send, launch: 3, +1, or name:web."),
-              command: str("launch: the command line."),
               event: { type: "string", enum: [...WAIT_EVENTS] },
               match: str("wait: the event's data contains this (class, title, workspace)."),
-              timeout_ms: int(`wait, launch: how long, default ${BOUNDS.wait_ms[2]} / ${BOUNDS.launch_ms[2]}.`, BOUNDS.wait_ms),
-              title: str("notify: the title."),
+              timeout_ms: int(`wait: how long, default ${BOUNDS.wait_ms[2]}.`, BOUNDS.wait_ms),
             },
             required: ["do"],
             additionalProperties: false,

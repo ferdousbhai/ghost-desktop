@@ -7,9 +7,6 @@ import type { DesktopLease } from "./lease.js";
 import { runChecked, type Runner } from "./run.js";
 import type { MouseButton, VirtualPointer } from "./wayland.js";
 
-/** wait and launch share one timeout_ms argument, so one range. */
-const TIMEOUT_RANGE = [100, 60_000] as const;
-
 /** Bounds the schema advertises and the steps enforce: [min, max, default]. */
 export const BOUNDS = {
   elements: [1, 200, 40],
@@ -17,8 +14,7 @@ export const BOUNDS = {
   interval_ms: [100, 5000, 500],
   clicks: [1, 3, 1],
   scale: [0.1, 2, 1],
-  wait_ms: [...TIMEOUT_RANGE, 10_000],
-  launch_ms: [...TIMEOUT_RANGE, 8000],
+  wait_ms: [100, 60_000, 10_000],
 } as const;
 export const MAX_STEPS = 30;
 const MAX_WINDOWS = 60;
@@ -43,10 +39,7 @@ export interface LookArgs {
   clipboard?: boolean;
 }
 
-export const ACT_VERBS = [
-  "click", "type", "key", "set", "perform", "drag", "scroll", "move",
-  "focus", "workspace", "send", "close", "fullscreen", "float", "launch", "wait", "notify", "copy",
-] as const;
+export const ACT_VERBS = ["click", "type", "key", "set", "perform", "drag", "scroll", "move", "wait"] as const;
 export type ActVerb = (typeof ACT_VERBS)[number];
 
 export interface ActStep {
@@ -66,12 +59,9 @@ export interface ActStep {
   action?: string;
   dy?: number;
   dx?: number;
-  workspace?: string;
-  command?: string;
   event?: keyof typeof EVENTS;
   match?: string;
   timeout_ms?: number;
-  title?: string;
 }
 
 export interface ActArgs {
@@ -90,7 +80,6 @@ export interface StepReport {
   did: string;
   disturbed: string[];
   warnings?: string[];
-  window?: Record<string, unknown>;
   event?: Record<string, unknown>;
 }
 
@@ -415,43 +404,6 @@ export function createDesktop(deps: DesktopDeps) {
         await moveCursor(step.x, step.y);
         return report(`pointer at ${step.x},${step.y}`);
       }
-      case "focus": {
-        const { client } = await window(step.window);
-        await hypr.dispatch({ kind: "focus", address: client.address });
-        disturbed.push("focus");
-        return report(`focused ${client.class}`, { window: windowFacts(client, client.address) });
-      }
-      case "workspace": {
-        if (!step.workspace) throw new DesktopError("invalid", "workspace needs workspace, such as 3 or name:web.");
-        await hypr.dispatch({ kind: "workspace", workspace: step.workspace });
-        disturbed.push("workspace");
-        return report(`on workspace ${step.workspace}`);
-      }
-      case "send": {
-        if (!step.workspace) throw new DesktopError("invalid", "send needs workspace.");
-        const { client } = await window(step.window);
-        await hypr.dispatch({ kind: "move", address: client.address, workspace: step.workspace });
-        return report(`moved ${client.class} to workspace ${step.workspace}`);
-      }
-      case "close":
-      case "fullscreen":
-      case "float": {
-        const { client } = await window(step.window);
-        await hypr.dispatch({ kind: step.do, address: client.address });
-        return report(`${step.do === "close" ? "closed" : `toggled ${step.do} on`} ${client.class}`);
-      }
-      case "launch": {
-        const { command } = step;
-        if (!command) throw new DesktopError("invalid", "launch needs command.");
-        const rule = step.workspace ? `[workspace ${step.workspace} silent] ` : "";
-        const opened = await hypr.waitEvent(EVENTS.open, {
-          timeoutMs: clampInt(step.timeout_ms, BOUNDS.launch_ms),
-          after: () => hypr.dispatch({ kind: "exec", command: `${rule}${command}` }),
-        });
-        if (!opened) return report(`launched ${command}; no window appeared`, { warnings: ["no window within the timeout; it may still be starting, or it reused an existing window"] });
-        const { client, active } = await window(`0x${opened.data.split(",", 1)[0]}`);
-        return report(`launched ${command}`, { window: windowFacts(client, active) });
-      }
       case "wait": {
         const event = step.event ?? "open";
         const seen = await hypr.waitEvent(EVENTS[event], {
@@ -459,16 +411,6 @@ export function createDesktop(deps: DesktopDeps) {
           ...(step.match ? { match: step.match } : {}),
         });
         return seen ? report(`saw ${event}`, { event: { event, data: clip(seen.data) } }) : report(`no ${event} event within the timeout`);
-      }
-      case "notify": {
-        if (!step.text) throw new DesktopError("invalid", "notify needs text.");
-        await runChecked(run, ["notify-send", "--app-name=ghost-desktop", "--", step.title || "ghost-desktop", step.text]);
-        return report("notification shown");
-      }
-      case "copy": {
-        if (step.text === undefined) throw new DesktopError("invalid", "copy needs text.");
-        await runChecked(run, ["wl-copy", "--", step.text], { timeoutMs: 3000, detached: true });
-        return report(`copied ${step.text.length} characters to the clipboard`);
       }
     }
   }
