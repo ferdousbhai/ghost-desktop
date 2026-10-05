@@ -19,9 +19,9 @@ bun install -g github:ferdousbhai/ghost-desktop
 claude mcp add --scope user desktop -- ghost-desktop
 ```
 
-Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.5`. Bun puts
+Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.6`. Bun puts
 `ghost-desktop` in `~/.bun/bin`. TypeScript throughout, run by Bun directly;
-its only package dependency is the MCP SDK.
+it has no package dependencies: the MCP stdio transport is `src/mcp.ts`.
 
 ## Tools
 

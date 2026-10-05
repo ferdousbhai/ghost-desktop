@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { ACT_VERBS, BOUNDS, MAX_STEPS, THEN_LOOKS, WAIT_EVENTS, type ActArgs, type Desktop, type LookArgs, type Observation } from "./desktop.js";
 import { DesktopError } from "./errors.js";
+import type { ToolContent, ToolResult, ToolServer } from "./mcp.js";
 import { MOUSE_BUTTONS } from "./wayland.js";
 
 export const LOOK = "desktop_look";
@@ -98,7 +97,7 @@ export const TOOLS = [
   },
 ] as const;
 
-function observationContent(observation: Observation, lead?: Record<string, unknown>): CallToolResult["content"] {
+function observationContent(observation: Observation, lead?: Record<string, unknown>): ToolContent[] {
   return [
     { type: "text", text: JSON.stringify({ ...lead, ...observation.facts }) },
     ...observation.images.map((shot) => ({ type: "image" as const, data: Buffer.from(shot.data.buffer, shot.data.byteOffset, shot.data.byteLength).toString("base64"), mimeType: shot.mimeType })),
@@ -106,7 +105,7 @@ function observationContent(observation: Observation, lead?: Record<string, unkn
 }
 
 /** The text leads with the code for a reader; `_meta` carries it, with details, for a program. */
-function errorResult(error: unknown, lead?: Record<string, unknown>): CallToolResult {
+function errorResult(error: unknown, lead?: Record<string, unknown>): ToolResult {
   const failure = DesktopError.from(error);
   const message = `${failure.code}: ${failure.message}`;
   return {
@@ -117,7 +116,7 @@ function errorResult(error: unknown, lead?: Record<string, unknown>): CallToolRe
 }
 
 /** Runs one tool call; `caller` keys the desktop lease. */
-async function callTool(desktop: Desktop, name: string, args: Record<string, unknown>, caller: string): Promise<CallToolResult> {
+async function callTool(desktop: Desktop, name: string, args: Record<string, unknown>, caller: string): Promise<ToolResult> {
   try {
     if (name === LOOK) return { content: observationContent(await desktop.look(args as LookArgs, caller)) };
     if (name === ACT) {
@@ -134,20 +133,19 @@ async function callTool(desktop: Desktop, name: string, args: Record<string, unk
 }
 
 /**
- * The stdio MCP server. A client may name who is acting in a call's
+ * The MCP tools server. A client may name who is acting in a call's
  * `_meta.caller` (ghostd does, per conversation); otherwise each server
  * process is its own caller, named after the connecting client.
  */
-export function createServer(desktop: Desktop, version: string): Server {
-  const server = new Server({ name: "ghost-desktop", version }, { capabilities: { tools: {} } });
+export function createServer(desktop: Desktop, version: string): ToolServer {
   const runId = randomUUID().slice(0, 8);
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS as never }));
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const meta = request.params._meta as { caller?: unknown } | undefined;
-    const caller = typeof meta?.caller === "string" && meta.caller
-      ? meta.caller.slice(0, 120)
-      : `${server.getClientVersion()?.name ?? "client"} ${runId}`;
-    return callTool(desktop, request.params.name, request.params.arguments ?? {}, caller) as never;
-  });
-  return server;
+  return {
+    name: "ghost-desktop",
+    version,
+    tools: TOOLS,
+    call(name, args, meta, client) {
+      const caller = typeof meta?.caller === "string" && meta.caller ? meta.caller.slice(0, 120) : `${client ?? "client"} ${runId}`;
+      return callTool(desktop, name, args, caller);
+    },
+  };
 }
