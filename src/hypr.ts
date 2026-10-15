@@ -75,8 +75,7 @@ function windowSelector(address: string): string {
 /** A desktop intent in both dispatch grammars: Lua (0.56+) and the legacy strings. */
 export type Intent =
   | { kind: "focus"; address: string }
-  | { kind: "cursor"; x: number; y: number }
-  | { kind: "shortcut"; mods: string; key: string; address: string };
+  | { kind: "cursor"; x: number; y: number };
 
 /** The argument of `dispatch`: one Lua call, or a legacy dispatcher and its argument. */
 export function encodeIntent(intent: Intent, lua: boolean): string {
@@ -90,10 +89,7 @@ export function encodeIntent(intent: Intent, lua: boolean): string {
       const [x, y] = [Math.round(intent.x), Math.round(intent.y)];
       return lua ? call("cursor.move", { x, y }) : `movecursor ${x} ${y}`;
     }
-    case "shortcut": {
-      const window = windowSelector(intent.address);
-      return lua ? call("send_shortcut", { mods: intent.mods, key: intent.key, window }) : `sendshortcut ${intent.mods},${intent.key},${window}`;
-    }
+
   }
 }
 

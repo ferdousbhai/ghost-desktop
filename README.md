@@ -19,7 +19,7 @@ bun install -g github:ferdousbhai/ghost-desktop
 claude mcp add --scope user desktop -- ghost-desktop
 ```
 
-Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.6`. Bun puts
+Pin a release with `github:ferdousbhai/ghost-desktop#v0.1.7`. Bun puts
 `ghost-desktop` in `~/.bun/bin`. TypeScript throughout, run by Bun directly;
 it has no package dependencies: the MCP stdio transport is `src/mcp.ts`.
 
@@ -52,7 +52,7 @@ A control from `ui` carries its center as `at`.
 | Screenshots | `grim -T` reads a window's own buffer, covered or on another workspace; a window on screen whose buffer cannot be read falls back to the screen region and says so; a hidden one is refused | `unavailable` |
 | Controls | the AT-SPI bus, over ghost-desktop's own D-Bus client | `unavailable`, with how to start the bus or enable Chromium's tree |
 | Pointer | Hyprland moves the cursor; a `zwlr_virtual_pointer_v1` device per step clicks, drags, and scrolls, then is destroyed | `unavailable` if the compositor lacks the protocol |
-| Keys | `send_shortcut` to the named window, no focus change. Hyprland names keys from the last keyboard's keymap, which after a `type` is wtype's, so a refused chord falls back to focusing the window and `wtype` | |
+| Keys | Focus the named window, then `wtype` presses and releases the chord; compositor shortcuts are not replayed as a fallback | |
 | Text | `wtype` into the focused field, the text as an argument (from stdin wtype drops characters past ~100); layout-independent | |
 | Clipboard (read) | `wl-paste` | `unavailable` if missing |
 
@@ -98,8 +98,11 @@ bun install
 bun run verify   # typecheck, lint, tests
 ```
 
-Tests never touch the real desktop; try changes in a nested Hyprland with its
-own runtime directory, D-Bus, and AT-SPI bus.
+Tests never touch the owner's desktop. `python scripts/check-chromium-keys.py`
+verifies key delivery to a covered Chromium window in nested Hyprland with
+private HOME, runtime, profiles, D-Bus, and AT-SPI buses. It needs Chromium,
+foot, Python, and the usual runtime dependencies; evidence stays in its printed
+temporary directory.
 
 ## Credits
 

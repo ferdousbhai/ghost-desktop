@@ -24,7 +24,7 @@ function element(ref: string, name: string, over: Partial<AxElement> = {}): AxEl
   return { ref, role: "button", name, states: ["sensitive", "showing"], actions: ["click"], box: [10, 310, 20, 20], ...over };
 }
 
-function harness(options: { locked?: boolean | null; elements?: AxElement[]; shortcutRefused?: string; opens?: string } = {}) {
+function harness(options: { locked?: boolean | null; elements?: AxElement[]; opens?: string; inputFails?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ghost-desktop-"));
   dirs.push(dir);
   const dispatched: Intent[] = [];
@@ -40,7 +40,6 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
     cursor: async () => [0, 0],
     locked: async () => (options.locked === undefined ? false : options.locked),
     dispatch: async (intent) => {
-      if (intent.kind === "shortcut" && options.shortcutRefused) throw new DesktopError("failed", options.shortcutRefused, { refused: options.shortcutRefused });
       dispatched.push(intent);
       if (intent.kind === "focus") active = intent.address;
     },
@@ -75,7 +74,7 @@ function harness(options: { locked?: boolean | null; elements?: AxElement[]; sho
   };
   const run: Runner = async (argv) => {
     commands.push([...argv]);
-    return { code: 0, stdout: "", stderr: "" };
+    return { code: options.inputFails ? 1 : 0, stdout: "", stderr: options.inputFails ? "virtual keyboard unavailable" : "" };
   };
   const capture = {} as Capture;
   const desktop = createDesktop({
@@ -99,19 +98,23 @@ describe("desktop_act", () => {
     await expect(other.act({ steps: [{ do: "key", keys: "Return" }] }, "claude")).rejects.toMatchObject({ code: "busy" });
   });
 
-  it("sends a chord to the window without moving focus, and falls back to the focused one", async () => {
-    const quiet = harness();
-    const done = await quiet.desktop.act({ steps: [{ do: "key", keys: "ctrl+s", window: "org.gnome.Nautilus" }] }, "a");
-    expect(quiet.dispatched).toEqual([{ kind: "shortcut", mods: "CTRL", key: "s", address: "0xb" }]);
-    expect(done.steps[0]!.disturbed).toEqual([]);
-    const loud = harness({ shortcutRefused: "send_shortcut: key not found" });
-    const fallback = await loud.desktop.act({ steps: [{ do: "key", keys: "ctrl+s", window: "org.gnome.Nautilus" }] }, "a");
-    expect(loud.commands.at(-1)).toEqual(["wtype", "-M", "ctrl", "-k", "s", "-m", "ctrl"]);
-    expect(fallback.steps[0]!.disturbed).toEqual(["focus"]);
-    const refused = harness({ shortcutRefused: "send_shortcut: window not found" });
-    const failed = await refused.desktop.act({ steps: [{ do: "key", keys: "ctrl+s", window: "org.gnome.Nautilus" }] }, "a");
-    expect(failed.failed?.error.message).toContain("window not found");
-    expect(refused.commands).toEqual([]);
+  it("focuses the target before balanced chord input, including covered windows", async () => {
+    const { desktop, dispatched, commands } = harness();
+    const done = await desktop.act({ steps: [{ do: "key", keys: "ctrl+shift+s", window: "org.gnome.Nautilus" }] }, "a");
+    expect(dispatched).toEqual([{ kind: "focus", address: "0xb" }]);
+    expect(commands).toEqual([["wtype", "-M", "ctrl", "-M", "shift", "-k", "s", "-m", "ctrl", "-m", "shift"]]);
+    expect(done.steps[0]!.disturbed).toEqual(["focus"]);
+    const again = await desktop.act({ steps: [{ do: "key", keys: "Return", window: "org.gnome.Nautilus" }] }, "a");
+    expect(again.steps[0]!.disturbed).toEqual([]);
+    expect(commands.at(-1)).toEqual(["wtype", "-k", "Return"]);
+  });
+
+  it("stops on keyboard delivery failure without reporting success or replaying the chord", async () => {
+    const { desktop, commands } = harness({ inputFails: true });
+    const result = await desktop.act({ steps: [{ do: "key", keys: "Return" }, { do: "type", text: "must not run" }] }, "a");
+    expect(result.steps).toEqual([]);
+    expect(result.failed?.error.message).toContain("virtual keyboard unavailable");
+    expect(commands).toEqual([["wtype", "-k", "Return"]]);
   });
 
   it("clicks a named control at its center with the real pointer, focusing its window first", async () => {

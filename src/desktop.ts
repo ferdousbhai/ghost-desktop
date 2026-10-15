@@ -351,19 +351,12 @@ export function createDesktop(deps: DesktopDeps) {
         if (!step.keys) throw new DesktopError("invalid", "key needs keys, such as ctrl+s or Return.");
         const chord = parseChord(step.keys);
         const { client, active } = await window(step.window);
-        try {
-          // Delivered to the window itself: no focus change, works on a covered window.
-          await hypr.dispatch({ kind: "shortcut", mods: chord.mods.join(" "), key: chord.keysym, address: client.address });
-          return report(`sent ${step.keys} to ${client.class}`);
-        } catch (error) {
-          // Hyprland names keys from the last keyboard's keymap; after a type that is wtype's,
-          // so it may not know this key. Any other refusal is the step's failure.
-          if (!(error instanceof DesktopError && /key not found|keysym/i.test(String(error.details.refused ?? "")))) throw error;
-          await focus(client, active, disturbed);
-          const mods = chord.mods.map((mod) => WTYPE_MODS[mod]);
-          await runChecked(run, ["wtype", ...mods.flatMap((mod) => ["-M", mod]), "-k", chord.keysym, ...mods.flatMap((mod) => ["-m", mod])]);
-          return report(`pressed ${step.keys} in the focused ${client.class}`, { warnings: [error.message] });
-        }
+        // send_shortcut can acknowledge a covered Chromium window without delivering
+        // the chord. Use the same focused virtual keyboard as text, with balanced keys.
+        await focus(client, active, disturbed);
+        const mods = chord.mods.map((mod) => WTYPE_MODS[mod]);
+        await runChecked(run, ["wtype", ...mods.flatMap((mod) => ["-M", mod]), "-k", chord.keysym, ...mods.flatMap((mod) => ["-m", mod])]);
+        return report(`pressed ${step.keys} in the focused ${client.class}`);
       }
       case "drag": {
         const { x, y, to_x: toX, to_y: toY } = step;

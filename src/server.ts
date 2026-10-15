@@ -52,7 +52,7 @@ export const TOOLS = [
     description:
       "Steer the desktop: steps run in order, stop at the first failure, and each reports what it disturbed (focus, "
       + "pointer). Prefer a control's own perform or set (by ref or name; works on covered windows) over the real pointer. "
-      + "click focuses its window first; key reaches window without moving focus. Launching apps and window management go "
+      + "click, type, and key focus their target window first. Launching apps and window management go "
       + "through Bash (hyprctl dispatch, omarchy). Refused while the screen is locked or another agent holds the desktop.",
     inputSchema: {
       type: "object",

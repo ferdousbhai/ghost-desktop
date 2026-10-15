@@ -48,7 +48,6 @@ describe("dispatch encoding", () => {
     expect(encodeIntent({ kind: "focus", address: "0xa" }, true)).toBe('hl.dsp.focus({ window = "address:0xa" })');
     expect(encodeIntent({ kind: "focus", address: "0xa" }, false)).toBe("focuswindow address:0xa");
     expect(encodeIntent({ kind: "cursor", x: 1.4, y: 2 }, true)).toBe("hl.dsp.cursor.move({ x = 1, y = 2 })");
-    expect(encodeIntent({ kind: "shortcut", mods: "CTRL", key: "s", address: "0xa" }, false)).toBe("sendshortcut CTRL,s,address:0xa");
   });
 });
 
