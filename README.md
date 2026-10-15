@@ -58,9 +58,9 @@ A control from `ui` carries its center as `at`.
 
 Every step reports what it disturbed: `focus` or `pointer`.
 
-A key chord reaches the window, never Hyprland's own bindings: `super+shift+3`
-sent to a terminal types `#`; what is bound in Hyprland is a `hyprctl
-dispatch` or `omarchy` command.
+Keys use normal compositor input, so Hyprland bindings can intercept a chord.
+Use `hyprctl dispatch` or `omarchy` for compositor commands; prefer a control's
+semantic action when a chord could trigger a desktop binding.
 
 ## Safety
 
