@@ -71,7 +71,11 @@ dispatch` or `omarchy` command.
   the user; another caller's `desktop_act` fails `busy` until the holder has
   been idle 15 s. `desktop_look` never claims it.
 - **Untrusted content.** Window titles, on-screen text, and control names are
-  data. A host should fence them as untrusted before its model reads them.
+  data. A successful result's text arrives inside an `<untrusted
+  source="desktop" id="…">` fence with a fresh id, behind an
+  `[injection-warning: …]` line when it reads like instructions to an agent
+  ([details](docs/injection-defense.md)). Error text is ghost-desktop's own and
+  is not fenced.
 
 ## Errors
 
@@ -81,9 +85,9 @@ of the text is written for the model and names the next move.
 
 ## For MCP hosts
 
-A host that serves several conversations from one process can name who is
-acting in each call's `_meta.caller`; that name keys the lease. Without it,
-each ghost-desktop process is one caller, named after its client. A failed
+Each ghost-desktop process is one caller, named after the client that
+started it; that name keys the lease. A host that serves several agents from
+one process can instead name who is acting in each call's `_meta.caller`. A failed
 call also carries `_meta.code` and `_meta.details`, for a program; the text is
 for the model.
 
