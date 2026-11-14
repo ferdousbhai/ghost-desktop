@@ -80,7 +80,7 @@ export function createCapture(run: Runner) {
         throw new DesktopError(
           "unavailable",
           `${client.class} is not on screen and its buffer could not be read (${bufferError}). `
-          + "Bring it forward with desktop_act focus, then look again.",
+          + "Bring it forward from a shell (hyprctl dispatch), then look again.",
         );
       }
       return grim(["-g", rect(geometry)], options, geometry, "screen-region", [
